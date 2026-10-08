@@ -1,0 +1,44 @@
+# Model files
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.pb
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.bin
+*.safetensors
+
+# Hugging Face cache
+.cache/
+transformers_cache/
+huggingface_hub/
+
+
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Virtual environments
+venv/
+env/
+.env
+.venv
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

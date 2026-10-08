@@ -1,0 +1,20 @@
+leave-one-photo-out accuracy 0.980 (100/102)
+
+              precision    recall  f1-score   support
+
+       empty      0.986     1.000     0.993        68
+      seated      1.000     0.947     0.973        19
+    straddle      0.933     0.933     0.933        15
+
+    accuracy                          0.980       102
+   macro avg      0.973     0.960     0.966       102
+weighted avg      0.981     0.980     0.980       102
+
+confusion (rows=true, cols=pred, order ['empty', 'seated', 'straddle']):
+[[68  0  0]
+ [ 0 18  1]
+ [ 1  0 14]]
+
+mistakes:
+  seated/shot_004_cell8.jpg -> predicted straddle
+  straddle/shot_005_cell8.jpg -> predicted empty

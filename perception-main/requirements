@@ -1,0 +1,41 @@
+# Perception / detection-server dependencies.
+#
+# The fairino SDK (imported under perception/ and fr5/) is vendored out-of-tree
+# at FR5_SDK_PATH (see config.py) and is NOT pip-installable, so it is not listed.
+#
+# SAM2 is optional (used by perception/research/* and the optional SAM mask
+# refinement path) and is installed from source, not PyPI:
+#   pip install "git+https://github.com/facebookresearch/sam2.git"
+
+# Core array + imaging
+numpy
+imageio
+opencv-contrib-python
+Pillow
+
+# Intel RealSense SDK (platform-specific wheel name)
+pyrealsense2-macosx; sys_platform == "darwin"
+pyrealsense2; sys_platform != "darwin"
+
+# Detection / segmentation models
+rfdetr
+supervision
+ultralytics
+torch
+
+# Scientific computing
+scipy
+scikit-learn
+
+# 3D geometry + visualization
+meshcat
+matplotlib
+
+# Metrics plotting / dataset tooling
+pandas
+
+# --- Optional: perception/research/* experiments only ---
+# open3d has no cp313 wheel yet; install on Python <=3.12, or build from source.
+# open3d
+# PyQt6 powers the interactive GUI in perception/research/2.py.
+PyQt6
