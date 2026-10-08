@@ -1,0 +1,52 @@
+# PAC 2026 partition pick & place — one place for every setting.
+# Paths are relative to this file. Values marked "ON SITE" must be measured/checked with the real PiPER.
+
+camera:
+  color_device: 4               # top D435i colour stream (/dev/video4)
+  depth_device: /dev/video0     # top D435i depth stream (Z16)
+  depth_size: [848, 480]
+  depth_unit_m: 0.001           # D435 default; verify with pyrealsense2 when installed
+  depth_frames: 10              # frames averaged (median) per depth capture
+
+models:
+  vggt: facebook/VGGT-1B-Commercial
+  grounding_dino: IDEA-Research/grounding-dino-base
+  sam2: facebook/sam2.1-hiera-large
+  rfdetr_weights: ../perception-main/ai_bubble/output/checkpoint_best_total.pth
+  rfdetr_resolution: 768
+  cell_classifier: ../perception-main/ai_failure/model/cell_classifier.joblib
+
+perception:
+  block_threshold: 0.5          # RF-DETR score for a bubble-wrap block
+  cell_min_conf: 0.7            # below -> "uncertain"
+  cell_min_visible: 0.9         # cell fraction inside the frame, else "out_of_view"
+
+robot:
+  type: mock                    # mock | piper
+  can_port: can0
+  speed_percent: 30
+  tcp_offset_m: 0.14            # flange -> finger tips along the tool axis (ON SITE)
+  down_rpy_deg: [180.0, 0.0, 0.0]   # flange orientation for a top-down grasp (ON SITE)
+  gripper_open_mm: 70
+  gripper_effort: 1000          # 0..5000 = 0..5 N·m
+  holding_min_mm: 10            # closed width above this = something between the fingers
+  mock_fail_rate: 0.0           # mock only: chance that a grasp misses (to exercise retries)
+
+calibration:
+  file: calib/pixel_to_robot.json   # homography colour px -> robot XY (m) on the table plane
+  table_z_robot_m: 0.0              # table surface height in the robot base frame (ON SITE)
+
+motion:
+  block_height_m: 0.04
+  safe_margin_m: 0.05           # extra clearance above the box rim while moving
+  lift_m: 0.05                  # lift after closing the gripper, then check the grasp
+  grasp_depth_m: 0.015          # finger tips this far below the block top
+  release_above_floor_m: 0.01   # block bottom this far above the cell floor when released
+
+retry:
+  pick: 3
+  place: 3
+
+run:
+  max_blocks: 5
+  log_dir: runs

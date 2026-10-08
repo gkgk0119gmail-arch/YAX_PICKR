@@ -1,0 +1,21 @@
+# Runtime used on the main desktop (Python 3.11, CUDA GPU). Versions = what the pipeline was tested with.
+torch==2.14.1
+torchvision==0.29.1
+transformers==5.18.0
+rfdetr[train,loggers]==1.11.2
+supervision==0.30.7
+accelerate==1.15.0
+huggingface-hub==1.33.0
+safetensors==0.8.0
+einops==0.8.2
+numpy==2.3.5
+scipy==1.17.1
+scikit-learn==1.9.1
+joblib==1.6.0
+pillow==12.3.0
+opencv-python
+pyyaml==6.0.3
+# robot
+piper_sdk==0.6.2
+python-can==4.6.1
+# VGGT is installed from source by install.sh (pip install -e vggt --no-deps)

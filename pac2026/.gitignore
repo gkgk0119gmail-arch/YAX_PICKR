@@ -1,0 +1,19 @@
+# run outputs
+runs/
+__pycache__/
+*.pyc
+
+# model weights / caches (download or use the team USB copy)
+*.pth
+*.pt
+*.safetensors
+*.onnx
+.cache/
+
+# environments
+.venv/
+venv/
+
+# secrets
+.env
+*token*

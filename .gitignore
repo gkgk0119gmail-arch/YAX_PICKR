@@ -1,0 +1,28 @@
+# environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# model weights and caches (setup/get_models.py, GitHub Release)
+*.pth
+*.pt
+*.safetensors
+*.onnx
+.cache/
+
+# vendored third-party sources (installed by setup/install.sh)
+perception-main/vggt/
+perception-main/sam2/
+
+# runtime outputs and raw captures
+pac2026/runs/
+perception-main/data/
+perception-main/ai_bubble/dataset/
+perception-main/ai_bubble/output/
+perception-main/ai_failure/data/
+*.raw
+
+# secrets
+.env
+*token*
