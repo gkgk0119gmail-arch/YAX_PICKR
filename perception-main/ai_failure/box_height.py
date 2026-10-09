@@ -46,9 +46,10 @@ def load_depth_m(path, n=10):
         return np.nanmedian(d, 0)
 
 
-def ransac_plane(P, iters=800, tol=0.004, max_tilt_deg=35, rng=np.random.default_rng(0)):
+def ransac_plane(P, iters=800, tol=0.004, max_tilt_deg=35, rng=None):
     """Plane n.x + d = 0 (unit n, pointing toward the camera) fitted to Nx3 points. Only planes
     within max_tilt_deg of facing the camera are considered, so a wall can never win."""
+    rng = np.random.default_rng(0) if rng is None else rng    # fresh per call: same samples every scan
     best, best_n = None, -1
     min_nz = np.cos(np.radians(max_tilt_deg))
     for _ in range(iters):
@@ -66,7 +67,7 @@ def ransac_plane(P, iters=800, tol=0.004, max_tilt_deg=35, rng=np.random.default
     n, d = best
     inl = np.abs(P @ n + d) < tol
     c = P[inl].mean(0)
-    _, _, vt = np.linalg.svd(P[inl] - c)
+    _, _, vt = np.linalg.svd(P[inl] - c, full_matrices=False)   # full U would be N x N (seconds)
     n = vt[2]
     d = -n @ c
     if d < 0:            # camera (origin) on the positive side: heights above the table are positive

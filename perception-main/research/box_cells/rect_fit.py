@@ -56,3 +56,49 @@ def grasp_from_rect(center, size, angle_deg):
     w, h = size
     jaw = angle_deg if w <= h else angle_deg + 90
     return center, jaw % 180, min(w, h), max(w, h)
+
+
+def refine_rect(pts, corners, band=6.0, corner_trim=0.15):
+    """Least-squares refinement of a RANSAC rectangle with the four sides kept at right angles.
+
+    Contour points within `band` of a side (and not within `corner_trim` of a side's ends, where bubble
+    wrap rounds the corners) are assigned to that side. Rotating the points of the 2nd/4th side by 90 deg
+    gives all four groups one common normal n: minimise sum_k sum_i (n.(p_i - mean_k))^2 -> n is the
+    smallest-eigenvalue eigenvector of the summed scatter matrices. Each side's offset is then its
+    points' mean along its normal. Returns (center, (w, h), angle_deg, n_used, corners 4x2).
+    """
+    pts = np.asarray(pts, np.float64)
+    c = np.asarray(corners, np.float64)
+    groups = []
+    for k in range(4):
+        a, b = c[k], c[(k + 1) % 4]
+        d = b - a
+        L = np.linalg.norm(d)
+        t = (pts - a) @ d / L ** 2                              # position along the side, 0..1
+        nrm = np.array([-d[1], d[0]]) / L
+        dist = np.abs((pts - a) @ nrm)
+        groups.append(pts[(dist < band) & (t > corner_trim) & (t < 1 - corner_trim)])
+    if min(len(g) for g in groups) < 5:
+        return None
+    rot = np.array([[0.0, -1.0], [1.0, 0.0]])                  # +90 deg
+    S = np.zeros((2, 2))
+    for k, g in enumerate(groups):
+        q = g @ rot.T if k % 2 else g                            # sides 1 and 3 turned onto sides 0 and 2
+        q = q - q.mean(0)
+        S += q.T @ q
+    w, v = np.linalg.eigh(S)
+    n = v[:, 0]                                                  # normal of sides 0 and 2
+    m = rot @ n                                                  # normal of sides 1 and 3
+    off = [g @ (n if k % 2 == 0 else m) for k, g in enumerate(groups)]
+    d0, d2 = np.mean(off[0]), np.mean(off[2])
+    d1, d3 = np.mean(off[1]), np.mean(off[3])
+    A = np.array([n, m])
+
+    def corner(dn, dm):
+        return np.linalg.solve(A, [dn, dm])
+    # side k lies on (normal . p = d_k); corners: side 3 & 0, 0 & 1, 1 & 2, 2 & 3
+    out = np.array([corner(d0, d3), corner(d0, d1), corner(d2, d1), corner(d2, d3)])
+    center = out.mean(0)
+    size = (abs(d1 - d3), abs(d2 - d0))
+    angle = np.degrees(np.arctan2(m[1], m[0])) % 90             # direction along sides 0 / 2
+    return center, size, angle, int(sum(len(g) for g in groups)), out

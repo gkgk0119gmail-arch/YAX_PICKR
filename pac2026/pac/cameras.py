@@ -4,6 +4,7 @@ is the distance at colour pixel (u, v), and each Frame carries the colour intrin
 Offline: a saved colour image (+ optional raw Z16 depth) so the whole pipeline runs without hardware."""
 import threading
 import time
+import warnings
 
 import cv2
 import numpy as np
@@ -50,8 +51,16 @@ class RealSenseCam:
         sensor = next(s for s in dev.query_sensors()
                       if any(sp.stream_type() == rs.stream.color for sp in s.get_stream_profiles()))
         for name in ("enable_auto_exposure", "enable_auto_white_balance", "exposure", "gain", "white_balance"):
-            if name in p:
-                sensor.set_option(getattr(rs.option, name), float(p[name]))
+            if name not in p:
+                continue
+            for attempt in range(3):                   # USB control transfers can time out right after start
+                try:
+                    sensor.set_option(getattr(rs.option, name), float(p[name]))
+                    break
+                except RuntimeError as e:
+                    if attempt == 2:
+                        print(f"camera profile: could not set {name} ({e}) - keeping the camera default", flush=True)
+                    time.sleep(0.3)
 
     def _loop(self):
         while self._run:
@@ -84,7 +93,8 @@ class RealSenseCam:
         stack, self._acc = np.stack(self._acc), None
         d = stack.astype(np.float32) * self.scale
         d[stack == 0] = np.nan
-        with np.errstate(all="ignore"):
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)       # pixels with no depth in any frame stay NaN
             return np.nanmedian(d, 0)
 
     def grab(self, with_depth=True) -> Frame:
@@ -146,7 +156,8 @@ class CameraManager:
         d = d[: len(d) // (self.dw * self.dh) * self.dw * self.dh].reshape(-1, self.dh, self.dw)[-self.nd:]
         d = d.astype(np.float32) * self.unit
         d[d == 0] = np.nan
-        with np.errstate(all="ignore"):
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)       # pixels with no depth in any frame stay NaN
             return np.nanmedian(d, 0)
 
     def top(self, with_depth=True) -> Frame:

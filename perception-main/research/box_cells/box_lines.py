@@ -25,6 +25,8 @@ MIN_SUPPORT = 0.35           # a line needs inliers >= this fraction of the box 
 GROUP_GAP = 0.10             # edges closer than this (fraction of side) belong to one wall/divider
 MAX_LINES = 40
 BOX_HEIGHT = 0.10            # m, expected wall/divider height above the table
+DIVIDER_MIN = 0.45           # an inner line group must stand this high (x wall height): real dividers 0.67-0.94,
+                             # a block edge in a cell ~0.26 (scans of 2026-10-09)
 
 
 @dataclass
@@ -51,13 +53,17 @@ def height_image(depth_m):
     return d, height
 
 
-def canny_edges(height, roi, box_height=BOX_HEIGHT, lo=20, hi=60):
-    """Canny on a height slice: <30% of box height -> 0, >70% -> 255.
+SLICE = (0.3, 0.7)           # Canny height slice, fraction of the wall height
+
+
+def canny_edges(height, roi, box_height=BOX_HEIGHT, lo=20, hi=60, slice_frac=None):
+    """Canny on a height slice: <30% of box height -> 0, >70% -> 255 (slice_frac overrides 0.3 / 0.7).
 
     Only wall/divider tops survive the slice, so each side of a divider gives one
     clean edge at mid-height and low things on the cell floors are ignored.
     """
-    s0, s1 = 0.3 * box_height, 0.7 * box_height
+    f0, f1 = slice_frac or SLICE
+    s0, s1 = f0 * box_height, f1 * box_height
     g = (255 * np.clip((np.nan_to_num(height, nan=0) - s0) / (s1 - s0), 0, 1)).astype(np.uint8)
     holes = (np.isnan(height) & roi).astype(np.uint8)
     g = cv2.inpaint(g, holes, 3, cv2.INPAINT_TELEA)
@@ -95,7 +101,7 @@ def ransac_lines(pts, axes, min_inliers, seed=0, trials=1500):
         # least-squares refit (PCA) on the inliers
         q = pts[inl]
         c = q.mean(0)
-        _, _, vt = np.linalg.svd(q - c)
+        _, _, vt = np.linalg.svd(q - c, full_matrices=False)
         dd = vt[0]
         axis = int(np.argmax(np.abs(axes @ dd)))
         if np.abs(axes[axis] @ dd) >= cos_tol:
@@ -162,6 +168,33 @@ def merge_raised_gaps(groups, axis, height, corners, box_height=BOX_HEIGHT):
     return merged
 
 
+def divider_height(g, axis, height, corners, axes, pad=4):
+    """p75 height (m) of the band covering one line group (+-pad px): a real divider / wall stands at
+    wall height there. height: NaN where a block stands (not counted)."""
+    across = axes[1 - axis]
+    lo, hi = min(g, key=lambda l: l.offset), max(g, key=lambda l: l.offset)
+    a = Line(lo.p - pad * across, lo.d, 0, axis)
+    b = Line(hi.p + pad * across, hi.d, 0, axis)
+    E1, E2 = _strip_ends(axis, corners)
+    quad = np.array([intersect(a, E1), intersect(a, E2), intersect(b, E2), intersect(b, E1)], np.int32)
+    m = np.zeros(height.shape, np.uint8)
+    cv2.fillConvexPoly(m, quad, 1)
+    vals = height[(m > 0) & ~np.isnan(height)]
+    return float(np.percentile(vals, 75)) if vals.size > 10 else float("nan")
+
+
+def drop_false_dividers(groups, axis, height, corners, axes, box_height):
+    """Inner groups that do not stand at wall height (block edges, shadows) are not dividers."""
+    if len(groups) <= 2:
+        return groups
+    keep = [groups[0]]
+    for g in groups[1:-1]:
+        h = divider_height(g, axis, height, corners, axes)
+        if np.isnan(h) or h > DIVIDER_MIN * box_height:
+            keep.append(g)
+    return keep + [groups[-1]]
+
+
 def add_missing_walls(groups, axis, height, corners, axes, side, box_height=BOX_HEIGHT):
     """If floor (not wall) lies between the outermost group and the box outline, the wall is out of
     view or undetected: use the outline edge itself as that wall."""
@@ -182,17 +215,53 @@ def add_missing_walls(groups, axis, height, corners, axes, side, box_height=BOX_
     return out
 
 
-def detect(depth_m, roi=None):
+def rim_height(h_box, min_height=0.02, band=0.05):
+    """Wall height from the outer walls only: outline of everything >= min_height, then per side the p75
+    height in a thin band just inside the outline edge; median over the 4 sides. Blocks standing in the
+    cells (taller than the walls) are inside the box, not on its rim, so they do not inflate it."""
+    corners = find_box_outline(h_box, min_height)
+    c0 = corners.mean(0)
+    hb = np.nan_to_num(h_box, nan=0.0)
+    out = []
+    for i in range(4):
+        a, b = corners[i], corners[(i + 1) % 4]
+        inner = lambda p: p + band * 2 * (c0 - p)            # pulled band-of-the-half-size toward the centre
+        m = np.zeros(hb.shape, np.uint8)
+        cv2.fillConvexPoly(m, np.array([a, b, inner(b), inner(a)], np.int32), 1)
+        v = hb[(m > 0) & (hb > 0.01)]
+        if v.size > 20:
+            out.append(float(np.percentile(v, 75)))
+    return float(np.median(out)) if out else None
+
+
+def detect(depth_m, roi=None, box_height=None, slice_frac=None):
     """roi: optional (x1, y1, x2, y2) in depth pixels where the box is (e.g. from an
     open-vocabulary detector). Raised things outside it (robot arm, other boxes) are
-    ignored when finding the box outline."""
+    ignored when finding the box outline.
+    box_height: wall height in m; None -> p99 of the height inside roi (BOX_HEIGHT without roi)."""
     d, height = height_image(depth_m)
     h_box = height
     if roi is not None:
         x1, y1, x2, y2 = (int(round(v)) for v in roi)
         h_box = np.full_like(height, np.nan)
         h_box[max(y1, 0):y2 + 1, max(x1, 0):x2 + 1] = height[max(y1, 0):y2 + 1, max(x1, 0):x2 + 1]
-    corners = find_box_outline(h_box, 0.5 * BOX_HEIGHT)     # tl, tr, br, bl
+    if box_height is None:
+        # p85 of the raised part, not p99: blocks already standing in cells are taller than the walls and
+        # cover less of the box than the walls / dividers do
+        raised = h_box[np.isfinite(h_box) & (h_box > 0.01)]
+        box_height = float(np.percentile(raised, 85)) if roi is not None and raised.size else BOX_HEIGHT
+        try:                                                 # better: the outer walls only (blocks in cells
+            box_height = rim_height(h_box) or box_height     # are taller and would inflate the p85)
+        except RuntimeError:
+            pass
+    # anything much taller than the walls (a block in a cell) counts as floor: no Canny edges from it
+    tall = np.isfinite(height) & (height > 1.4 * box_height)
+    k = max(3, int(0.03 * max(height.shape)) | 1)        # also its sloping sides (they cross the Canny slice)
+    tall = cv2.dilate(tall.astype(np.uint8), np.ones((k, k), np.uint8)).astype(bool)
+    h_no_blocks = np.where(tall, np.nan, height)          # for the divider check: blocks not counted
+    height = np.where(tall, 0.0, height)
+    h_box = np.where(tall & np.isfinite(h_box), 0.0, h_box)
+    corners = find_box_outline(h_box, 0.5 * box_height)     # tl, tr, br, bl
     tl, tr, br, bl = corners
     ax = (tr - tl) / np.linalg.norm(tr - tl)
     ay = (bl - tl) / np.linalg.norm(bl - tl)
@@ -202,16 +271,18 @@ def detect(depth_m, roi=None):
     roi = np.zeros(d.shape, np.uint8)
     cv2.fillConvexPoly(roi, corners.astype(np.int32), 1)
     roi = cv2.dilate(roi, np.ones((7, 7), np.uint8)).astype(bool)
-    edges = canny_edges(height, roi)
+    edges = canny_edges(height, roi, box_height, slice_frac=slice_frac)
 
     ys, xs = np.nonzero(edges)
     lines = ransac_lines(np.stack([xs, ys], 1), axes, int(MIN_SUPPORT * side))
     hg = group_lines(lines, 0, tl, axes, side)               # horizontal: walls top/bottom + dividers
     vg = group_lines(lines, 1, tl, axes, side)
-    hg = merge_raised_gaps(hg, 0, height, corners) if hg else hg
-    vg = merge_raised_gaps(vg, 1, height, corners) if vg else vg
-    hg = add_missing_walls(hg, 0, height, corners, axes, side)
-    vg = add_missing_walls(vg, 1, height, corners, axes, side)
+    hg = merge_raised_gaps(hg, 0, height, corners, box_height) if hg else hg
+    vg = merge_raised_gaps(vg, 1, height, corners, box_height) if vg else vg
+    hg = drop_false_dividers(hg, 0, h_no_blocks, corners, axes, box_height)
+    vg = drop_false_dividers(vg, 1, h_no_blocks, corners, axes, box_height)
+    hg = add_missing_walls(hg, 0, height, corners, axes, side, box_height)
+    vg = add_missing_walls(vg, 1, height, corners, axes, side, box_height)
     if len(hg) < 2 or len(vg) < 2:
         raise RuntimeError(f"walls not found (h groups={len(hg)}, v groups={len(vg)})")
 
@@ -230,7 +301,7 @@ def detect(depth_m, roi=None):
             core = cv2.erode(m, np.ones((5, 5), np.uint8)).astype(bool) & ~np.isnan(d)
             cells.append(Cell(r, c, quad, tuple(quad.mean(0)),
                               float(np.median(d[core])) if core.any() else float("nan")))
-    return dict(rows=rows, cols=cols, corners=corners, edges=edges, lines=lines,
+    return dict(rows=rows, cols=cols, corners=corners, edges=edges, lines=lines, box_height=box_height,
                 h_groups=hg, v_groups=vg, cells=cells, depth=d)
 
 

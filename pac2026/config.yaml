@@ -31,14 +31,17 @@ perception:
   block_threshold: 0.5          # RF-DETR score for a bubble-wrap block
   cell_min_conf: 0.7            # below -> "uncertain"
   cell_min_visible: 0.9         # cell fraction inside the frame, else "out_of_view"
+  # basket: rows / cols / wall height are measured in every scan (the basket differs between runs).
+  # Only to force a known basket, uncomment:
+  # basket: {rows: 2, cols: 2, wall_height_m: 0.055}
 
 robot:
   type: mock                    # mock | piper
   can_port: can0
   speed_percent: 30
-  tcp_offset_m: 0.14            # flange -> finger tips along the tool axis (ON SITE)
+  tcp_offset_m: 0.1286          # reported end pose (link6 frame) -> closed finger tips; ruler 90 mm from the mount face + ~35 mm link6->mount; hand-eye 128.6 mm (2026-10-09)
   down_rpy_deg: [180.0, 0.0, 0.0]   # flange orientation for a top-down grasp (ON SITE)
-  gripper_open_mm: 70
+  gripper_open_mm: 95            # gripper stroke 100 mm (max_range_config), block 80 mm
   gripper_effort: 1000          # 0..5000 = 0..5 N·m
   holding_min_mm: 10            # closed width above this = something between the fingers
   mock_fail_rate: 0.0           # mock only: chance that a grasp misses (to exercise retries)
