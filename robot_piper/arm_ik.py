@@ -8,6 +8,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as Rot
 
+import hover_test as _ht
 from hover_test import JOINT_LIM, fk
 
 SEEDS = [np.array(s, float) for s in ([0, 110, -80, 0, 60, 0], [0, 90, -60, 0, 40, 0], [0, 130, -100, 0, 65, 0],
@@ -25,6 +26,57 @@ def rotvec(M):
     if s > 1e-6:
         return v * (ang / (2.0 * s))
     return Rot.from_matrix(M).as_rotvec()                   # ~180 deg: rare, exact fallback
+
+
+ANALYTIC_JAC = False          # exact Jacobian for ik_pose (2 FK per solver step instead of 7); False -> scipy's
+                              # finite differences (the old way)
+_D2R = np.pi / 180.0
+
+
+def fk_axes(q_deg):
+    """fk() plus every joint's axis (unit, base frame) and origin (mm): for the analytic Jacobian."""
+    th = np.radians(np.asarray(q_deg, float)) + _ht._DH_THETA
+    ct, st = np.cos(th), np.sin(th)
+    T = np.eye(4)
+    Z, O = np.empty((6, 3)), np.empty((6, 3))
+    for i in range(6):
+        ca, sa, a, d = _ht._CA[i], _ht._SA[i], _ht._DH_A[i], _ht._DH_D[i]
+        T = T @ np.array([[ct[i], -st[i], 0.0, a],
+                          [st[i] * ca, ct[i] * ca, -sa, -sa * d],
+                          [st[i] * sa, ct[i] * sa, ca, ca * d],
+                          [0.0, 0.0, 0.0, 1.0]])
+        Z[i], O[i] = T[:3, 2], T[:3, 3]
+    return T[:3, 3].copy(), T[:3, :3].copy(), Z, O
+
+
+def _skew(v):
+    return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+
+
+def _jl_inv(phi):
+    """Inverse left Jacobian of SO(3) at rotation vector phi: d(rotvec) = Jl^-1 * (small rotation, left)."""
+    t = np.linalg.norm(phi)
+    P = _skew(phi)
+    if t < 1e-6:
+        return np.eye(3) - 0.5 * P + P @ P / 12.0
+    return np.eye(3) - 0.5 * P + (1.0 / t ** 2 - (1.0 + np.cos(t)) / (2.0 * t * np.sin(t))) * (P @ P)
+
+
+def pose_jac(q, Rt, tcp_mm):
+    """d(ik_pose residual)/dq (6 x 6, per degree): tip position rows from the joint axes, rotation rows
+    200 * Jl^-1(rotvec(Rt^T R)) Rt^T z_i."""
+    pos, R, Z, O = fk_axes(q)
+    phi = rotvec(Rt.T @ R)
+    if np.linalg.norm(phi) > 2.8:                 # near 180 deg Jl^-1 blows up: finite differences there
+        def res(x):
+            p_, R_ = fk(x)
+            return np.r_[p_ + R_[:, 2] * tcp_mm, 200 * rotvec(Rt.T @ R_)]
+        r0 = res(q)
+        return np.array([(res(q + e * 1e-6) - r0) / 1e-6 for e in np.eye(6)]).T
+    tip = pos + R[:, 2] * tcp_mm
+    Jp = np.cross(Z, tip - O).T
+    Jr = 200.0 * _jl_inv(phi) @ (Rt.T @ Z.T)
+    return np.vstack([Jp, Jr]) * _D2R
 
 
 def tool_R(yaw_deg, beta_deg):
@@ -81,7 +133,8 @@ def ik_pose(tip_m, yaw_deg, beta_deg, tcp_m, q_seed=None, quick=False):
     best = None
     seeds = ([np.asarray(q_seed, float)] if q_seed is not None else []) + ([] if quick and q_seed is not None else SEEDS)
     for s in seeds:
-        sol = least_squares(resid, np.clip(s, lo + 1e-3, hi - 1e-3), bounds=(lo, hi))
+        sol = least_squares(resid, np.clip(s, lo + 1e-3, hi - 1e-3), bounds=(lo, hi),
+                            jac=(lambda q: pose_jac(q, Rt, tcp_m * 1000)) if ANALYTIC_JAC else "2-point")
         r = resid(sol.x)
         pe, re = float(np.linalg.norm(r[:3])), float(np.degrees(np.linalg.norm(r[3:]) / 200))
         if best is None or pe + 10 * re < best[1] + 10 * best[2]:

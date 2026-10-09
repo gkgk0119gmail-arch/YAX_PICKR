@@ -23,6 +23,7 @@ PM = ROOT / "perception-main"
 sys.path[:0] = [str(ROOT / "robot_piper"), str(PM), str(PM / "research" / "box_cells")]
 import arm_ik  # noqa: E402
 import hover_test as ht  # noqa: E402
+import ik_pool  # noqa: E402
 from board_hover import REST_Q, connect, enable  # noqa: E402
 import live_view  # noqa: E402
 import runlog  # noqa: E402
@@ -240,6 +241,8 @@ def check_leg(q_a, q_b, tcp, table_z, blocks, carrying, poly, rim_z, cell_xy=Non
 SOFT_CLOSE_S = 1.2           # close the gripper over this long (a gentle squeeze of the bubble wrap)
 OPEN_EFFORT = 3000            # opening only: a higher effort opens faster (a slow opening dragged the block);
                               # closing keeps config gripper_effort (soft squeeze)
+REACH_MAX_M = 0.57            # blocks farther than this from the base are not planned (robot raised 5 cm: 57 cm OK)
+RESCANS = 2                   # empty cells left at the end: scan again (basket + Qwen) and refill, at most this often
 CELL_LOOK = False             # empty-gripper D405 look at the next cell before fetching a block (off: the
                               # calibration is good enough; --cell-look turns it on)
 
@@ -471,9 +474,14 @@ def update_scene_from_obs(scene, res, carried=None, blocks=True, basket=True):
 D405_OUT_MIN_M = 0.01         # the D405 must sit at least this far outside (from the base) and above the tip
 
 
+_D405_RELAX = [False]          # last resort: a block reachable only with the D405 inside may still be taken
+
+
 def d405_outside(q, tcp):
-    """Team rule: the wrist D405 always on the OUTSIDE of the arm (farther from the base than the fingertips)
-    and above them - never turned under / toward the robot."""
+    """Team rule: the wrist D405 on the OUTSIDE of the arm (farther from the base than the fingertips) and above
+    them - not turned under / toward the robot. Relaxed (always True) only for the last-resort plan."""
+    if _D405_RELAX[0]:
+        return True
     import collide
     pos, R = arm_ik.fk(q)
     cam = R @ collide.T_FLANGE_D405[:3, 3] + pos / 1000
@@ -589,7 +597,17 @@ def scan_scene(finder, tag="scene"):
     num = number_cells(cells)
     poly, axis_deg, pitch = basket_geometry(cells)
     rim_z = summ["robot"]["rim_z_m"]
+    try:                                                    # Qwen3-VL: how many blocks, roughly where (once)
+        import qwen_blocks
+        finder.prior, qtext = qwen_blocks.find(color, finder)
+        (run / "qwen_blocks.txt").write_text(qtext)
+        runlog.event("qwen_blocks", n=len(finder.prior), boxes=[b["box"] for b in finder.prior])
+    except Exception as e:
+        finder.prior = None
+        print(f"[qwen] not used ({e}) - Grounding DINO alone")
     objs = finder(color, depth, K)
+    if finder.last_prior:
+        print(f"[scene] blocks: Qwen {finder.last_prior}")
     blocks = [o for o in objs if o["label"] == "block" and o.get("robot")]
     occupied = {k for k, c in num.items() if any(block_in_cell(b, c, pitch) for b in blocks)}
     free = [b for b in blocks if not inside(poly, b["robot"]["top_xyz_m"][:2])]
@@ -869,7 +887,7 @@ def team_rule(scene, empty, blocks):
 
 
 def pickable(scene):
-    return [b for b in scene["free"] if 0.15 < b["robot"]["reach_m"] < 0.55 and b["robot"]["fits_gripper"]
+    return [b for b in scene["free"] if 0.15 < b["robot"]["reach_m"] < REACH_MAX_M and b["robot"]["fits_gripper"]
             and not b.get("unpickable")]
 
 
@@ -887,6 +905,33 @@ def planned_order(scene, want):
     return out
 
 
+def rescan_blocks(scene, finder):
+    """Blocks only, for the refill rounds: the basket is mostly full now (its grid can no longer be found), but its
+    cells are known. One new frame at the rest pose -> Qwen3-VL block count -> Grounding DINO boxes -> blocks on
+    the table (outside the basket) and the cells that hold a block (a tall detection in the cell)."""
+    run = ROOT / "pac2026" / "runs" / f"rescan_{time.strftime('%Y%m%d_%H%M%S')}"
+    color, depth, K = capture_clear(run, finder)
+    try:
+        import qwen_blocks
+        finder.prior, qtext = qwen_blocks.find(color, finder)
+        (run / "qwen_blocks.txt").write_text(qtext)
+    except Exception as e:
+        finder.prior = None
+        print(f"[qwen] not used ({e}) - Grounding DINO alone")
+    objs = finder(color, depth, K)
+    blocks = [o for o in objs if o["label"] == "block" and o.get("robot")]
+    filled = {k for k, c in scene["num"].items() if any(block_in_cell(b, c, scene["pitch"]) for b in blocks)}
+    for k in filled - scene["occupied"]:
+        c = scene["num"][k]["robot"]["floor_xyz_m"]
+        scene["placed"].append(dict(xy=np.array(c[:2]), yaw=scene["axis"], top=c[2] + BLOCK_H_MIN))
+    scene["occupied"] |= filled
+    scene["free"] = [b for b in blocks if not inside(scene["poly"], b["robot"]["top_xyz_m"][:2])]
+    scene["run"], scene["K"] = run, K
+    print(f"[rescan] Qwen {finder.last_prior}; {len(scene['free'])} block(s) on the table, cells filled "
+          f"{sorted(scene['occupied'])}")
+    runlog.event("rescan_blocks", free=[b["robot"]["top_xyz_m"] for b in scene["free"]], occupied=sorted(scene["occupied"]))
+
+
 def run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, only_block=None):
     """Put one of the remembered free blocks into cell_no. Placed blocks are obstacles. The arm starts
     wherever the previous round left it (scene["q_now"]), not from the rest pose."""
@@ -899,7 +944,7 @@ def run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, only_block=N
     run.mkdir(parents=True, exist_ok=True)
     print(f"[cell {cell_no}] centre ({cell_xy[0] * 1000:.0f}, {cell_xy[1] * 1000:.0f}) mm, "
           f"{np.hypot(*cell_xy) * 1000:.0f} mm from the base")
-    cand = [b for b in scene["free"] if 0.15 < b["robot"]["reach_m"] < 0.55 and b["robot"]["fits_gripper"]]
+    cand = [b for b in scene["free"] if 0.15 < b["robot"]["reach_m"] < REACH_MAX_M and b["robot"]["fits_gripper"]]
     if only_block is not None:                              # the order given by the team
         cand = [only_block] if only_block in scene["free"] else []
     if not cand:
@@ -1097,10 +1142,17 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
     pick_ok, place_ok = set(), set()                      # tilts that work at the block / at the cell
     best_entry = None                                      # least-bad way in, if none keeps the clearance
     d405_in = set()                                        # tilts dropped only because the D405 would be inside
+    t_ik = time.time()
+    pre = ik_pool.precompute(BETAS, pick_xy, z_grasp, top_z, HOVERS, yaws_g, cell_xy, z_carry, z_place, z_max,
+                             yaws_p, tcp, STEP_M)            # every tilt x yaw at once on the worker processes
+    if pre:
+        print(f"   IK for {len(pre[0]) + len(pre[1])} tilt x yaw candidates on {ik_pool.WORKERS} cores: "
+              f"{time.time() - t_ik:.2f} s")
     for beta in BETAS:
         feas = []
         for yaw_g in yaws_g:
-            q_try = arm_ik.ik_pose([pick_xy[0], pick_xy[1], z_grasp + 0.02], yaw_g, beta, tcp)
+            q_try = (pre[0][(beta, yaw_g)][0] if pre else
+                     arm_ik.ik_pose([pick_xy[0], pick_xy[1], z_grasp + 0.02], yaw_g, beta, tcp))
             if q_try[1] < 1.5 and q_try[2] < 0.5:
                 if not d405_outside(q_try[0], tcp):
                     d405_in.add(beta)
@@ -1112,11 +1164,14 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             if key not in _PICK_CACHE:
                 # start of the straight descent: 6 cm above the top, lower (4.5 / 3 cm) where the wrist
                 # cannot reach that high with this yaw / tilt
-                for hov in HOVERS:
-                    z_line_top = top_z + hov
-                    L = arm_ik.pose_line(pick_xy, z_line_top, z_grasp, yaw_g, beta, tcp)
-                    if L is not None:
-                        break
+                if pre:
+                    _, L, z_line_top, Lup_pre = pre[0][(beta, yaw_g)]
+                else:
+                    for hov in HOVERS:
+                        z_line_top = top_z + hov
+                        L = arm_ik.pose_line(pick_xy, z_line_top, z_grasp, yaw_g, beta, tcp)
+                        if L is not None:
+                            break
                 if L is None:
                     _PICK_CACHE[key] = None
                 else:
@@ -1124,7 +1179,7 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                     P, Tg = collide.body_world(L[-1], tcp, 0.08)
                     carried = (blk_world - Tg[:3, 3]) @ Tg[:3, :3]          # block in the flange frame
                     # lift: straight up past the hover point for as long as the wrist reaches, THEN move
-                    Lup = extend_up(pick_xy, z_line_top, z_max, yaw_g, beta, tcp, L[0])
+                    Lup = Lup_pre if pre else extend_up(pick_xy, z_line_top, z_max, yaw_g, beta, tcp, L[0])
                     c_lift, w_lift = collide.check_path(L[::-1] + Lup[1:], tcp, 0.08, scene_c, carried,
                                                         skip_block=tgt_idx)
                     _PICK_CACHE[key] = (L, Lup, carried, c_app, w_app, c_lift, w_lift, z_line_top)
@@ -1137,16 +1192,20 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                 continue                                    # cannot beat the best forced plan found so far
             place_order = []
             for yp in yaws_p:
-                q_try = arm_ik.ik_pose([cell_xy[0], cell_xy[1], z_carry], yp, beta, tcp)
+                q_try = pre[1][(beta, yp)][0] if pre else arm_ik.ik_pose([cell_xy[0], cell_xy[1], z_carry], yp, beta, tcp)
                 if q_try[1] < 1.5 and q_try[2] < 0.5 and d405_outside(q_try[0], tcp):
                     place_order.append((d405_score(q_try[0], tcp), yp))
             for z_carry, yaw_p in [(zc, yp) for zc in z_carries for _, yp in sorted(place_order, reverse=True)]:
-                PL = arm_ik.pose_line(cell_xy, z_carry, z_place, yaw_p, beta, tcp)
+                if pre:
+                    _, PL, PLup = pre[1][(beta, yaw_p)]
+                else:
+                    PL = arm_ik.pose_line(cell_xy, z_carry, z_place, yaw_p, beta, tcp)
                 if PL is None:
                     continue
                 place_ok.add(beta)
                 # the cell side as high as the wrist reaches too: carry high, then straight down
-                PLup = extend_up(cell_xy, z_carry, z_max, yaw_p, beta, tcp, PL[0])
+                if not pre:
+                    PLup = extend_up(cell_xy, z_carry, z_max, yaw_p, beta, tcp, PL[0])
                 # the way in: the joint-5 turn over the cell must keep the held block above the other blocks;
                 # a larger grasp tilt lets the upright block stay higher over the cell (more room for the turn)
                 e_clr, _ = entry_clearance(Lup[-1], PLup[-1], tcp, carried, scene_c, tgt_idx,
@@ -1204,6 +1263,15 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                    f"any of them (it is released with the same tilt)")
         runlog.event("no_plan", cell=cell_no, block=pick_xy, jaw=r["jaw_yaw_deg"], size=r.get("size_m"), H=H,
                      pick_ok=sorted(pick_ok), place_ok=sorted(place_ok), why=why)
+        if not _D405_RELAX[0] and ((not pick_ok and d405_in) or (pick_ok and not place_ok)):   # maybe only the
+            # D405 rule stands in the way (at the block or at the cell): allow it as the last resort
+            print("   only reachable with the D405 inside / under the gripper - planning again with that allowed")
+            _D405_RELAX[0] = True
+            try:
+                return plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly, axis_deg, rim_z,
+                                     p, finder, K, scan_dir, run, args, tcp, effort, open_mm, start_q, scene)
+            finally:
+                _D405_RELAX[0] = False
         raise (PickSkip if not pick_ok else Skip)(f"no tilt up to 32 deg works for this block ({np.hypot(*pick_xy) * 1000:.0f} mm from the "
                    f"base): {why}")
     is_forced = "bad" in plan
@@ -1294,10 +1362,6 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
 
     try:
         mv(hover_name, L[0])
-        if obs is not None:                                  # arm over the blocks, basket in view: has it moved?
-            _, jh, _ = ht.read(p)
-            jh[1] = (jh[1] + 180) % 360 - 180
-            obs.start(jh, tcp, holding=False)
         gripper(p, RELEASE_MM, OPEN_EFFORT, secs=0.5)             # fully open (100 mm) before going down
         d405 = None
         if wrist:                                            # D405: centred? (tilt = beta is expected)
@@ -1346,13 +1410,6 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                         z_grasp, tip_above_bottom = z_grasp_plan, z_grasp_plan - table_z
             else:
                 print(f"   D405 check skipped: {d405.get('why')}")
-        if obs is not None and obs.pending():                # arm over the block: basket only, blocks untouched
-            ch = update_scene_from_obs(scene, obs.wait(), carried=None, blocks=False)
-            if ch["basket_shift_mm"] or cell_no in scene["occupied"]:
-                _, jn, _ = ht.read(p)
-                jn[1] = (jn[1] + 180) % 360 - 180
-                scene["q_now"] = jn
-                raise Replan(f"the basket moved {ch['basket_shift_mm']} (mm, deg) - new cell centres, planning again")
         line("down to block", L)
         w = soft_close(p, effort)
         print(f"   gripper closed at {w:.0f} mm")
@@ -1604,12 +1661,15 @@ def main(argv=None, finder=None):
         scene["q_now"] = REST_Q.copy()
         scene["obs"] = None
         scene["finder"] = finder                              # grid re-detection when the basket moves
-        if args.go:
+        def open_live():
+            if not args.go:
+                return
             from observer import Observer
             try:
                 scene["obs"] = Observer(finder)                 # top camera stays open for the fast checks
                 live_view.set_source("top", scene["obs"].cam.latest, scene["obs"].cam.intrinsics)
             except Exception as e:
+                scene["obs"] = None
                 print(f"[check] top camera checks unavailable: {e}")
             try:
                 scene["wrist"] = WristSeen()                    # D405 open for the whole run (checks + live view)
@@ -1617,6 +1677,18 @@ def main(argv=None, finder=None):
             except Exception as e:
                 scene["wrist"] = None
                 print(f"[check] wrist D405 unavailable: {e}")
+
+        def close_live():
+            live_view.set_source("top", None)
+            live_view.set_source("wrist", None)
+            for k in ("obs", "wrist"):
+                if scene.get(k) is not None:
+                    try:
+                        scene[k].close()
+                    except Exception:
+                        pass
+                    scene[k] = None
+        open_live()
         num = scene["num"]
         want = sorted(num) if args.cells == ["auto"] else [int(c) for c in args.cells]
 
@@ -1634,7 +1706,7 @@ def main(argv=None, finder=None):
             for b in out_of:
                 t = np.array(b["robot"]["top_xyz_m"][:2]) * 1000
                 why = (f"{b['robot']['reach_m'] * 100:.0f} cm from the base (reach 15-55 cm)"
-                       if not 0.15 < b["robot"]["reach_m"] < 0.55 else "too wide for the gripper")
+                       if not 0.15 < b["robot"]["reach_m"] < REACH_MAX_M else "too wide for the gripper")
                 print(f"[plan] block ({t[0]:.0f}, {t[1]:.0f}) is NOT used: {why} - move it closer if it is needed")
             left = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in [c for _, c in po]]
             if left:
@@ -1656,54 +1728,86 @@ def main(argv=None, finder=None):
             go_rest(p, args.speed)
             scene["q_now"] = REST_Q.copy()
 
-        rounds = 0
-        fails = {}                                          # id(block) -> failed tries (tried again later)
-        dead_cells = set()                                  # cells no block could go into
-        while pairs is None and want and rounds < args.max:     # team rule: cells in their fixed order, each
-            rounds += 1                                         # gets the next block in the block order
-            empty = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in dead_cells]
-            blocks = pickable(scene)
-            if not empty or not blocks:
-                print(f"[order] done: empty cells {empty}, blocks left {len(blocks)}")
+        for attempt in range(RESCANS + 1):                  # leftover empty cells: scan again (Qwen) and refill
+            rounds = 0
+            fails = {}                                          # id(block) -> failed tries (tried again later)
+            dead_cells = set()                                  # cells no block could go into
+            while pairs is None and want and rounds < args.max:     # team rule: cells in their fixed order, each
+                rounds += 1                                         # gets the next block in the block order
+                empty = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in dead_cells]
+                blocks = pickable(scene)
+                if not empty or not blocks:
+                    print(f"[order] done: empty cells {empty}, blocks left {len(blocks)}")
+                    break
+                bxy = lambda b: np.array(b["robot"]["top_xyz_m"][:2])
+                ordered, rank, C = team_rule(scene, empty, blocks)
+                cell = rank(None)[0]                                # the next cell of the fill order
+                # blocks in their order; one that failed goes behind the others and is tried again later
+                ordered = sorted(ordered, key=lambda b: (fails.get(id(b), 0), b.get("order_rank", 1e9)))
+                done_round = False
+                for blk in ordered:
+                    if blk not in scene["free"]:                    # removed meanwhile (ghost / placed)
+                        continue
+                    print(f"[order] cell {cell} ({scene['cell_angles'][cell]} deg from straight ahead) <- block "
+                          f"{blk.get('order_rank')} at {np.round(bxy(blk) * 1000).tolist()} mm"
+                          + (f" (retry {fails[id(blk)]})" if fails.get(id(blk)) else ""))
+                    try:
+                        if CELL_LOOK:
+                            survey_cell(cell, scene, p, args, tcp)  # empty gripper: measure the cell first
+                        else:
+                            refresh_blocks(scene)                   # top camera, taken with the arm over the basket
+                        r = run_cell(cell, scene, p, finder, args, tcp, effort, open_mm, blk)
+                        results.append(r)
+                        done_round = True
+                        break
+                    except Skip as e:                               # this block: the next one goes into this cell
+                        fails[id(blk)] = fails.get(id(blk), 0) + 1
+                        print(f"   block {blk.get('order_rank')} not done ({e}) - the next block goes into cell {cell}"
+                              f"; this one is tried again later")
+                        if fails[id(blk)] >= 2:
+                            blk["unpickable"] = str(e)
+                            print(f"   block {blk.get('order_rank')}: failed twice - left out (until it is seen moved)")
+                    except Halt as e:
+                        print(f"[cell {cell}] HALT: {e}")
+                        results.append(dict(cell=cell, status="HALT", why=str(e)))
+                        want = []                                   # stop the whole run
+                        done_round = True
+                        break
+                if not done_round:
+                    dead_cells.add(cell)
+                    print(f"[order] no block could go into cell {cell} - it stays empty, next cell")
+                    results.append(dict(cell=cell, status="skipped", why="no block could be placed in it"))
+            halted = any(r["status"] == "HALT" for r in results)
+            empty_left = [k for k in want if k in scene["num"] and k not in scene["occupied"]]
+            if pairs is not None or halted or not args.go or not empty_left or attempt == RESCANS:
                 break
-            bxy = lambda b: np.array(b["robot"]["top_xyz_m"][:2])
-            ordered, rank, C = team_rule(scene, empty, blocks)
-            cell = rank(None)[0]                                # the next cell of the fill order
-            # blocks in their order; one that failed goes behind the others and is tried again later
-            ordered = sorted(ordered, key=lambda b: (fails.get(id(b), 0), b.get("order_rank", 1e9)))
-            done_round = False
-            for blk in ordered:
-                if blk not in scene["free"]:                    # removed meanwhile (ghost / placed)
-                    continue
-                print(f"[order] cell {cell} ({scene['cell_angles'][cell]} deg from straight ahead) <- block "
-                      f"{blk.get('order_rank')} at {np.round(bxy(blk) * 1000).tolist()} mm"
-                      + (f" (retry {fails[id(blk)]})" if fails.get(id(blk)) else ""))
-                try:
-                    if CELL_LOOK:
-                        survey_cell(cell, scene, p, args, tcp)  # empty gripper: measure the cell first
-                    else:
-                        refresh_blocks(scene)                   # top camera, taken with the arm over the basket
-                    r = run_cell(cell, scene, p, finder, args, tcp, effort, open_mm, blk)
-                    results.append(r)
-                    done_round = True
-                    break
-                except Skip as e:                               # this block: the next one goes into this cell
-                    fails[id(blk)] = fails.get(id(blk), 0) + 1
-                    print(f"   block {blk.get('order_rank')} not done ({e}) - the next block goes into cell {cell}"
-                          f"; this one is tried again later")
-                    if fails[id(blk)] >= 2:
-                        blk["unpickable"] = str(e)
-                        print(f"   block {blk.get('order_rank')}: failed twice - left out (until it is seen moved)")
-                except Halt as e:
-                    print(f"[cell {cell}] HALT: {e}")
-                    results.append(dict(cell=cell, status="HALT", why=str(e)))
-                    want = []                                   # stop the whole run
-                    done_round = True
-                    break
-            if not done_round:
-                dead_cells.add(cell)
-                print(f"[order] no block could go into cell {cell} - it stays empty, next cell")
-                results.append(dict(cell=cell, status="skipped", why="no block could be placed in it"))
+            print(f"\n[rescan {attempt + 1}/{RESCANS}] cells {empty_left} are still empty - back to rest, scan again "
+                  f"(basket + Qwen) and fill them with the blocks that are left")
+            runlog.event("rescan", attempt=attempt + 1, empty=empty_left)
+            live_view.status(f"rescan {attempt + 1}: cells {empty_left} still empty")
+            if scene.get("obs") is not None and scene["obs"].pending():
+                scene["obs"].wait()
+            to_rest()
+            close_live()
+            try:
+                rescan_blocks(scene, finder)                    # the basket cells are kept, blocks found again
+            except (Halt, SystemExit, Exception) as e:
+                print(f"[rescan] failed: {e} - stopping here")
+                open_live()
+                break
+            scene["q_now"] = REST_Q.copy()
+            scene.pop("order_O", None)
+            if args.cells == ["auto"]:
+                want = sorted(scene["num"])
+            open_live()
+            live_view.scene(scene)
+            po = planned_order(scene, want)
+            live_view.plan(po)
+            print("[rescan] fill order: " + ", ".join(
+                f"block ({b['robot']['top_xyz_m'][0] * 1000:.0f}, {b['robot']['top_xyz_m'][1] * 1000:.0f}) -> cell {k}"
+                for b, k in po) if po else "[rescan] no reachable block for the empty cells")
+            if not po:
+                break
         while pairs is not None and todo and len(tried) < args.max:
             cell_no = todo.pop(0)
             tried.add(cell_no)

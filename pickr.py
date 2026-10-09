@@ -115,6 +115,8 @@ def main():
     ap.add_argument("--order", help='block->cell from the last preview, e.g. "B2:2,B1:1,B3:4"')
     ap.add_argument("--no-view", action="store_true", help="no live camera window")
     args = ap.parse_args()
+    import ik_pool
+    ik_pool.start()                                       # planner IK workers: forked before any other thread
     import runlog
     runlog.start(sys.argv)                                # console + every move -> pac2026/runs/logs/pickr_<time>/
     if not args.no_view:                                  # live window with both RealSense views (own process)

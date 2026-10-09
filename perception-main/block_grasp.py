@@ -31,11 +31,12 @@ VGGT_ID = "facebook/VGGT-1B-Commercial"
 BLOCK_PROMPTS = ["bubble wrap block.", "styrofoam block.", "box wrapped in bubble wrap."]
 CONTAINER_PROMPTS = ["wooden tray.", "basket with dividers.", "grid of dividers.", "basket.", "tray."]
 CONTAINER_WORDS = ("tray", "basket", "grid", "divider")
-GDINO_THR = 0.25                 # box + text threshold (lower = more candidates, slower, more false hits)
+GDINO_THR = 0.10                 # box + text threshold (low: few misses; DBSCAN on the 3D points checks every hit)
 GDINO_ID = "IDEA-Research/grounding-dino-base"
 SAM_ID = "facebook/sam2.1-hiera-large"
 MIN_BLOCK_M, MAX_BLOCK_M = 0.04, 0.15
-MIN_BLOCK_SCORE = 0.30
+MIN_BLOCK_SCORE = 0.10           # with the Qwen3-VL prior (the scan): Qwen decides which hits are blocks
+GDINO_THR_FAST, MIN_BLOCK_SCORE_FAST = 0.20, 0.20   # fast checks during the run (no prior): fewer, surer hits
 CONTAINER_M = (0.20, 0.50)      # tray / basket footprint; bigger = a table, smaller = not a container
 CONTAINER_WALL_M = 0.02         # rim must stand this much above the table (a flat ChArUco board does not)
 GRIPPER_MAX_M = 0.100            # on-site gripper stroke (max_range_config 100 mm)
@@ -143,7 +144,8 @@ class BlockFinder:
     def _objects(self, img):
         """Merge block and container hits that cover the same object; keep the best score of each group."""
         objs = []
-        for group, s, b, p in self._gdino_batched(img):
+        for group, s, b, p in self._gdino_batched(img, GDINO_THR if getattr(self, "prior", None) is not None
+                                                  else GDINO_THR_FAST):
             for o in objs:
                 if iou(o["box"], b) > 0.7:
                     if s > o["score"][group]:
@@ -161,6 +163,11 @@ class BlockFinder:
 
     def _to_base(self, p_cam):
         return self.T[:3, :3] @ p_cam + self.T[:3, 3]
+
+    def _pix_to_base(self, u, v, z, K):
+        """Many pixels at once (arrays u, v, depth z) -> base-frame points Nx3."""
+        P = np.stack([(u - K["cx"]) / K["fx"] * z, (v - K["cy"]) / K["fy"] * z, z], 1)
+        return P @ self.T[:3, :3].T + self.T[:3, 3]
 
     def _rise(self, depth, K, box_mask):
         """How far the inside of a box rises above the table around it (m): p95 height inside - table ring."""
@@ -188,6 +195,54 @@ class BlockFinder:
         hollow = rim - np.median(zi) > 0.5 * (rim - np.median(zr))
         return float(rim - np.median(zr)) if hollow else 0.0
 
+    def _gdino_crop(self, img, box, grow=0.35):
+        """Grounding DINO on a crop around a rough box: the best block hit there, in full-picture px, or None."""
+        W, H = img.size
+        x1, y1, x2, y2 = box
+        gx, gy = grow * (x2 - x1), grow * (y2 - y1)
+        cx1, cy1, cx2, cy2 = (int(max(0, x1 - gx)), int(max(0, y1 - gy)), int(min(W, x2 + gx)), int(min(H, y2 + gy)))
+        hits = [h for h in self._gdino_batched(img.crop((cx1, cy1, cx2, cy2))) if h[0] == "block"]
+        if not hits:
+            return None
+        g, sc, b, lab = max(hits, key=lambda h: h[1] * iou([b + o for b, o in zip(h[2], (cx1, cy1, cx1, cy1))], box))
+        b = [b[0] + cx1, b[1] + cy1, b[2] + cx1, b[3] + cy1]
+        return (sc, b, lab) if iou(b, box) > 0.2 else None
+
+    def _match_prior(self, img, objs, prior):
+        """Qwen3-VL's rough boxes decide HOW MANY blocks there are and roughly where; Grounding DINO gives the
+        clean box of each: the hit overlapping the rough box most (any score), else Grounding DINO on a crop
+        around it, else the rough box itself. Hits that match no rough box are not blocks."""
+        cands = [o for o in objs if o["label"] in ("block", "other") and o["score"]["block"] > 0]
+        used, blocks, rep = set(), [], dict(qwen=len(prior), gdino=0, crop=0, qwen_box=0)
+        for p in prior:
+            best = max(((iou(o["box"], p["box"]), i) for i, o in enumerate(cands) if i not in used), default=(0, None))
+            if best[1] is not None and best[0] >= 0.4:
+                used.add(best[1])
+                o = cands[best[1]]
+                o.update(label="block", qwen_pose=p.get("pose"), why=None)
+                blocks.append(o)
+                rep["gdino"] += 1
+                continue
+            c = self._gdino_crop(img, p["box"])
+            if c is not None:
+                sc, b, lab = c
+                blocks.append(dict(box=b, score={"block": sc, "container": 0.0}, prompt={"block": lab, "container": None},
+                                   label="block", qwen_pose=p.get("pose"), from_crop=True))
+                rep["crop"] += 1
+            else:
+                blocks.append(dict(box=list(p["box"]), score={"block": 0.0, "container": 0.0},
+                                   prompt={"block": "Qwen", "container": None}, label="block", qwen_pose=p.get("pose"),
+                                   qwen_box=True))
+                rep["qwen_box"] += 1
+        rest = []
+        for i, o in enumerate(cands):
+            if i not in used and o["label"] == "block":
+                o["label"], o["why"] = "other", "no Qwen block here"
+        for o in objs:
+            if not any(o is b for b in blocks):
+                rest.append(o)
+        return blocks + rest, rep
+
     def _median_depth(self, depth, mask):
         z = depth[mask]
         z = z[np.isfinite(z) & (z > 0.1)]
@@ -197,6 +252,7 @@ class BlockFinder:
         img = Image.fromarray(cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB))
         H, W = depth_m.shape
         objs = self._objects(img)
+        min_score = MIN_BLOCK_SCORE if getattr(self, "prior", None) is not None else MIN_BLOCK_SCORE_FAST
         for o in objs:                                   # metric size from the box and the depth inside it
             x1, y1, x2, y2 = (int(round(v)) for v in o["box"])
             m = np.zeros((H, W), bool)
@@ -210,11 +266,18 @@ class BlockFinder:
                 o["label"] = "container" if ok else "other"
                 o["why"] = None if ok else (f"size {size * 100:.0f} cm" if not CONTAINER_M[0] <= size <= CONTAINER_M[1]
                                             else "flat or solid (no walls around a hollow inside)")
-            elif size < MIN_BLOCK_M or o["score"]["block"] < MIN_BLOCK_SCORE:
+            elif size < MIN_BLOCK_M or o["score"]["block"] < min_score:
                 o["label"] = "other"
                 o["why"] = f"block score {o['score']['block']:.2f}" if size >= MIN_BLOCK_M else "too small"
             else:
                 o["label"] = "block"
+        prior, self.prior = getattr(self, "prior", None), None     # Qwen3-VL boxes, for this call only
+        self.last_prior = None
+        if prior is not None:                            # block count / rough places from Qwen, clean boxes
+            try:                                         # from Grounding DINO
+                objs, self.last_prior = self._match_prior(img, objs, prior)
+            except Exception as e:                       # never lose the Grounding DINO result for this
+                self.last_prior = dict(error=str(e))
         containers = [o for o in objs if o["label"] == "container"]
         blocks = [o for o in objs if o["label"] == "block"]
         for b in blocks:
@@ -338,9 +401,11 @@ class BlockFinder:
             if z_top is None:
                 continue
             top = self._to_base(self._deproject(*center, z_top, K))
-            ring_pts = [self._to_base(self._deproject(u, v, depth_m[v, u], K))
-                        for v, u in zip(*np.nonzero(ring)) if np.isfinite(depth_m[v, u]) and depth_m[v, u] > 0.1][::7]
-            table_z = float(np.median([p[2] for p in ring_pts])) if ring_pts else float("nan")
+            rv, ru = np.nonzero(ring)
+            rd = depth_m[rv, ru]
+            rok = np.isfinite(rd) & (rd > 0.1)
+            ring_pts = self._pix_to_base(ru[rok][::7], rv[rok][::7], rd[rok][::7], K)
+            table_z = float(np.median(ring_pts[:, 2])) if len(ring_pts) else float("nan")
             C = np.array([self._to_base(self._deproject(u, v, z_top, K)) for u, v in corners])   # rect corners at top
             e1, e2 = C[1] - C[0], C[3] - C[0]
             l1, l2 = np.linalg.norm(e1[:2]), np.linalg.norm(e2[:2])
@@ -350,7 +415,7 @@ class BlockFinder:
             vs, us = np.nonzero(m)
             ds = depth_m[vs, us]
             ok = np.isfinite(ds) & (ds > 0.1)
-            P = np.array([self._to_base(self._deproject(u, v, d, K)) for u, v, d in zip(us[ok][::3], vs[ok][::3], ds[ok][::3])])
+            P = self._pix_to_base(us[ok][::3], vs[ok][::3], ds[ok][::3], K)
             if len(P) > 100:
                 zt = np.percentile(P[:, 2], 90)
                 F = P[P[:, 2] > zt - 0.015]
