@@ -3,7 +3,10 @@ about the vertical axis for a top-down grasp.
 
 MockRobot  - no hardware; logs every command (optionally fails grasps to exercise the retries).
 PiperRobot - AgileX PiPER via piper_sdk (C_PiperInterface_V2). Written from the SDK docs / demos,
-             NOT yet run on a real arm: check units, down_rpy_deg and tcp_offset_m on site."""
+             NOT yet run on a real arm: check units, down_rpy_deg and tcp_offset_m on site.
+SimRobot   - MuJoCo PiPER twin (sim_tools/twin_server.py) fed with the perceived scene."""
+import json
+import socket
 import time
 
 import numpy as np
@@ -116,5 +119,80 @@ class PiperRobot(RobotBase):
         self.p.MotionCtrl_1(0x01, 0, 0)
 
 
+class SimRobot(RobotBase):
+    """MuJoCo twin (sim_tools/twin_server.py) over TCP. The pipeline's perception still runs on the
+    real cameras; the twin rebuilds the perceived scene and answers gripper width / cell state."""
+    twin = True
+
+    def __init__(self, cfg, log):
+        self.cfg, self.log = cfg["robot"], log
+        self.sock, self.buf = None, b""
+
+    def _call(self, **msg):
+        self.sock.sendall((json.dumps(msg) + "\n").encode())
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("twin server closed the connection")
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        r = json.loads(line)
+        if not r.get("ok"):
+            self.log.warn(f"[sim] {msg['op']} failed: {r.get('error')}")
+        return r
+
+    def connect(self):
+        host, port = self.cfg.get("sim_host", "localhost"), self.cfg.get("sim_port", 8765)
+        try:
+            self.sock = socket.create_connection((host, port), timeout=120)
+        except OSError as e:
+            raise RuntimeError(f"twin server not reachable at {host}:{port} "
+                               f"(start ./sim_tools/run.sh twin_server.py)") from e
+        self.log.info(f"[sim] connected to MuJoCo twin {host}:{port}")
+
+    def sync_scene(self, box, part, grasps, calib, block_h):
+        from .twin import scene_msg
+        msg = scene_msg(box, part, grasps, calib, block_h)
+        b = msg["box"]
+        self.log.info(f"[sim] scene -> twin: {b['rows']}x{b['cols']} cell {b['cell']*100:.1f} cm, "
+                      f"h {b['height']*100:.1f} cm, centre ({b['center'][0]:.3f}, {b['center'][1]:.3f}) m, "
+                      f"yaw {b['yaw_deg']:.0f} deg, {len(msg['blocks'])} block(s)")
+        self._call(**msg)
+
+    def move_to(self, x, y, z, yaw):
+        r = self._call(op="move", x=x, y=y, z=z, yaw=yaw)
+        self.log.info(f"[sim] move_to x={x:.3f} y={y:.3f} z={z:.3f} m yaw={np.degrees(yaw):.1f} deg"
+                      + (f" (tilt {r['tilt_deg']} deg)" if r.get("tilt_deg") else ""))
+        return r.get("ok", False)
+
+    def open(self, width_mm=None):
+        self._call(op="grip", width_mm=width_mm or self.cfg["gripper_open_mm"])
+
+    def close(self):
+        self._call(op="grip", width_mm=0.0)
+
+    def gripper_width_mm(self):
+        return self._call(op="width")["width_mm"]
+
+    def cell_state(self, x, y):
+        return self._call(op="cell_state", x=x, y=y)["state"]
+
+    def home(self):
+        self.move_to(0.3, 0.0, 0.3, 0.0)
+
+    def report(self):
+        r = self._call(op="report")
+        if r.get("hits"):
+            top = sorted(r["hits"].items(), key=lambda kv: -kv[1])[:5]
+            self.log.warn("[sim] arm touched the partition: " + ", ".join(f"{k}x{v}" for k, v in top))
+        else:
+            self.log.info("[sim] arm never touched the partition")
+        return r
+
+    def stop(self):
+        self.log.info("[sim] stop")
+
+
 def make_robot(cfg, log):
-    return PiperRobot(cfg, log) if cfg["robot"]["type"] == "piper" else MockRobot(cfg, log)
+    kind = cfg["robot"]["type"]
+    return {"piper": PiperRobot, "sim": SimRobot}.get(kind, MockRobot)(cfg, log)

@@ -26,3 +26,4 @@ perception-main/ai_failure/data/
 # secrets
 .env
 *token*
+sim_tools/twin_runs/

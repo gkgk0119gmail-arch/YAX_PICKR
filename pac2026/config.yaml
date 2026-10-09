@@ -22,7 +22,7 @@ perception:
   cell_min_visible: 0.9         # cell fraction inside the frame, else "out_of_view"
 
 robot:
-  type: mock                    # mock | piper
+  type: mock                    # mock | piper | sim (MuJoCo twin)
   can_port: can0
   speed_percent: 30
   tcp_offset_m: 0.14            # flange -> finger tips along the tool axis (ON SITE)
@@ -31,6 +31,8 @@ robot:
   gripper_effort: 1000          # 0..5000 = 0..5 N·m
   holding_min_mm: 10            # closed width above this = something between the fingers
   mock_fail_rate: 0.0           # mock only: chance that a grasp misses (to exercise retries)
+  sim_host: localhost           # sim only: sim_tools/twin_server.py (may run on another PC)
+  sim_port: 8765
 
 calibration:
   file: calib/pixel_to_robot.json   # homography colour px -> robot XY (m) on the table plane

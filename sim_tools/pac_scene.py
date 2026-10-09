@@ -18,17 +18,46 @@ import mujoco
 
 from piper_sim import scene_spec
 
+# ── real-world geometry the base MJCF does not have (sources in each comment) ─────────────
+#: AgileX PiPER parallel gripper, from the AgileX URDF (mujoco_menagerie/agilex_piper/piper.xml):
+#: fingers at link6 z 0.13503, pads 0.075–0.135 m along the tool axis, 24–30 mm wide, 5 mm thick,
+#: inner faces touch when closed. The wego MJCF is hand-made (tip 0.090, 8 mm fingers, 16 mm closed gap).
+FINGER_REACH = 0.135      # link6 -> fingertip (m); piper_sdk demo uses 0.145, config tcp_offset_m 0.14
+FINGER_LEN = 0.060        # pad length along the tool axis
+FINGER_T = 0.005          # pad thickness
+FINGER_W = 0.027          # pad width
+FINGER_GAP0 = 0.0         # inner face offset from the centre when closed
+#: top D435i ~0.85 m above the table (RealSense table distance, docs/update_2026-10-07.md), 42° vertical FOV (spec)
+TOP_CAM_Z, TOP_CAM_FOVY = 0.85, 42.0
+
+
+def real_gripper(s):
+    """Swap the hand-made gripper for the AgileX dimensions (slide joints / actuators stay)."""
+    base_z = s.body("gripper_base").pos[2]                         # gripper_base sits on link6 at +0.035
+    housing = s.body("gripper_base").geoms[0]
+    housing.size = [0.03, 0.015, (FINGER_REACH - FINGER_LEN) / 2]   # housing fills link6 .. pad start
+    housing.pos = [0, 0, (FINGER_REACH - FINGER_LEN) / 2 - base_z]
+    for name, side in (("finger_l", 1), ("finger_r", -1)):
+        b = s.body(name)
+        b.pos = [0, side * FINGER_GAP0, FINGER_REACH - FINGER_LEN / 2 - base_z]
+        g = b.geoms[0]
+        g.size = [FINGER_W / 2, FINGER_T / 2, FINGER_LEN / 2]
+        g.pos = [0, side * FINGER_T / 2, 0]
+    cam = s.camera("top")
+    cam.pos = [cam.pos[0], cam.pos[1], TOP_CAM_Z]
+    cam.fovy = TOP_CAM_FOVY
+
 
 @dataclass
 class PartitionBox:
     rows: int = 4
     cols: int = 4
-    cell: float = 0.07          # inner cell size (m), square
-    height: float = 0.10        # wall & divider height (m) — perception's BOX_HEIGHT assumption
-    wall_t: float = 0.004       # outer wall thickness (m)
-    div_t: float = 0.003        # divider thickness (m)
-    floor_t: float = 0.003      # floor thickness (m)
-    center: tuple = (0.23, -0.12)  # box centre (m) — on the −y side, close in: far cells are at the reach limit
+    cell: float = 0.10          # inner cell size (m), square — 4x4 opening ~10x10 cm (RealSense, 10-07)
+    height: float = 0.12        # wall & divider height (m) — 4x4 rim p99 12.2–12.4 cm (RealSense, 10-07)
+    wall_t: float = 0.004       # outer wall thickness (m) — not measured
+    div_t: float = 0.003        # divider thickness (m) — not measured
+    floor_t: float = 0.008      # cell floor above the table (m) — +0.8 cm (RealSense, 10-07)
+    center: tuple = (0.34, -0.12)  # box centre (m) — NOT measured; a placement the arm can serve (twin gets the perceived one)
     yaw_deg: float = 0.0
 
     @property
@@ -87,20 +116,24 @@ class Blocks:
     size: float = 0.04          # edge length (m) — fingers are 8 mm thick, so size + 16 mm must fit a cell
     mass: float = 0.03
     rgba: tuple = (0.85, 0.2, 0.15, 1.0)
-    #: pick spots — where a straight-down grasp still reaches at carry height (x ≲ 0.32)
+    #: pick spots on the +y side, clear of the default box — NOT measured
     spots: list = field(default_factory=lambda: [
-        (0.18, 0.08), (0.25, 0.08), (0.18, 0.15), (0.25, 0.15), (0.32, 0.08),
-        (0.18, 0.22), (0.25, 0.22), (0.32, 0.15)])
+        (0.17, 0.16), (0.24, 0.16), (0.31, 0.16), (0.17, 0.23), (0.24, 0.23),
+        (0.31, 0.23), (0.38, 0.16), (0.38, 0.23)])
     #: full edge lengths (x, y, z) in the block's own frame; None → a `size` cube.
     #: e.g. (0.08, 0.03, 0.03) is a 3×3×8 cm prism lying with its long axis along local x
     dims: tuple | None = None
     #: per-spot yaw (deg) — which way a lying prism points
     yaws: list | None = None
+    #: per-block full edge lengths (x, y, z), overrides `dims` (twin: each perceived block its own size)
+    dims_each: list | None = None
 
     def ids(self):
         return [f"block{i}" for i in range(self.count)]
 
-    def half(self):
+    def half(self, i=None):
+        if self.dims_each is not None and i is not None:
+            return [d / 2 for d in self.dims_each[i]]
         return [d / 2 for d in self.dims] if self.dims else [self.size / 2] * 3
 
 
@@ -111,11 +144,13 @@ def build(box: PartitionBox | None = None, blocks: Blocks | None = None):
     if blocks.count > len(blocks.spots):
         raise ValueError(f"only {len(blocks.spots)} block spots defined")
     spec = {"version": 1, "id": "pac", "name": "PAC partition box", "objects": [
-        {"id": bid, "label": bid, "shape": "box", "size": blocks.half(),
-         "pos": [x, y, blocks.half()[2]], "euler_deg": [0, 0, yaw],
+        {"id": bid, "label": bid, "shape": "box", "size": blocks.half(i),
+         "pos": [x, y, blocks.half(i)[2]], "euler_deg": [0, 0, yaw],
          "rgba": list(blocks.rgba), "mass": blocks.mass, "movable": True}
-        for bid, (x, y), yaw in zip(blocks.ids(), blocks.spots, blocks.yaws or [0] * len(blocks.spots))]}
+        for i, (bid, (x, y), yaw) in enumerate(zip(blocks.ids(), blocks.spots,
+                                                   blocks.yaws or [0] * len(blocks.spots)))]}
     s = scene_spec.compose(spec)
+    real_gripper(s)
 
     body = s.worldbody.add_body(name="pbox", pos=[*box.center, 0],
                                 quat=scene_spec.euler_quat([0, 0, box.yaw_deg]))

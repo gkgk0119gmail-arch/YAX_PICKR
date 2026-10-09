@@ -29,6 +29,7 @@ import mujoco
 import numpy as np
 
 from pac_demo import FINGER_REACH, PartitionWatch, grip_for_width
+from pac_scene import FINGER_GAP0, FINGER_T
 from pac_scene import Blocks, PartitionBox, build
 from pick_place_demo import Sim, arm_model
 
@@ -308,7 +309,7 @@ def plan_block(ik, box, c, u, w, L, cell_xy, q, last, obstacle_top=None):
 
 # ── recovery: push a wedged prism upright ──────────────────────────────────────
 NUDGE_TILT = 15.0          # deg from vertical above which a seated prism gets nudged
-FINGER_HALF = 0.016        # closed fingers' half-width along the opening axis
+FINGER_HALF = FINGER_GAP0 + FINGER_T   # closed fingers' half-width along the opening axis
 
 
 def plan_nudge(box, c, u, w, L):

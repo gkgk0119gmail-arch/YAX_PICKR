@@ -16,17 +16,14 @@ import argparse
 import mujoco
 import numpy as np
 
-from pac_scene import Blocks, add_args, box_from_args, build
+from pac_scene import FINGER_GAP0, FINGER_LEN, FINGER_REACH, FINGER_T, Blocks, add_args, box_from_args, build
 from pick_place_demo import GRASP_SEED_DEG, Sim, arm_model
 from piper_sim.scene import FINGER_STROKE_M
 
-FINGER_REACH = 0.090     # link6 → fingertip along tool z (measured, sim_demo.py)
-FINGER_T = 0.008         # finger thickness (scene XML: half-size 0.004 → 8 mm)
-FINGER_GAP0 = 0.008      # inner face offset from centre when closed
 TIP_ABOVE_BOTTOM = 0.005  # fingertips this far above the block bottom while held
 CLEAR = 0.012            # block-bottom clearance above the walls while carrying (m)
 SEAT_GAP = 0.008         # block-bottom above the cell floor when released (m) …
-WRIST_CLEAR = 0.02       # … unless that would bring link6 (the wrist) within this of the wall top
+WRIST_CLEAR = 0.01       # … unless that would bring the gripper housing (above the pads) within this of the wall top
 ARM_BODIES = ("link4", "link5", "link6", "gripper_base", "finger_l", "finger_r")
 
 
@@ -40,9 +37,9 @@ def plan(box, blocks, block_xy, cell_xy):
     s = blocks.size
     z_grasp = TIP_ABOVE_BOTTOM
     z_carry = box.height + CLEAR + TIP_ABOVE_BOTTOM        # block bottom clears the walls
-    # release low in the cell, but keep the wrist above the walls (a deep insert drags link5
-    # across the dividers); a 4 cm block then drops the last ~2 cm
-    z_seat = max(box.floor_t + SEAT_GAP, box.height + WRIST_CLEAR - FINGER_REACH) + TIP_ABOVE_BOTTOM
+    # release low in the cell, but keep the gripper housing above the walls: only the 6 cm pads
+    # may enter the cell, so with 12 cm walls the block drops the last few cm
+    z_seat = max(box.floor_t + SEAT_GAP, box.height + WRIST_CLEAR - FINGER_LEN) + TIP_ABOVE_BOTTOM
     # release opening: wide enough to let go, narrow enough that fingers stay inside the cell
     lo, hi = s + 0.004, box.cell - 2 * FINGER_T - 0.006
     if lo > hi:
@@ -63,10 +60,10 @@ def plan(box, blocks, block_xy, cell_xy):
     ]
 
 
-def tool_rotations(ik, tilts_deg=(0, 3, 6, 9, 12)):
+def tool_rotations(ik, tilts_deg=tuple(range(0, 31, 3))):
     """Candidate grasp orientations, least tilted first. Straight down can't reach the far
     cells at carry height, so the tool may lean (top toward the robot, like the repo's seed
-    pose) a few degrees; yaw is free because square blocks/cells are 90°-symmetric."""
+    pose) — up to ~30° with the real gripper; yaw is free because square blocks/cells are 90°-symmetric."""
     out = []
     for tilt in tilts_deg:
         t = np.radians(tilt)

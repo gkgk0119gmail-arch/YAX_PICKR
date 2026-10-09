@@ -4,6 +4,7 @@ One entry point for the whole pick & place pipeline, with a live monitoring dash
 
   python run.py                           live cameras, robot from config (mock by default)
   python run.py --robot piper             real PiPER (CAN must be up)
+  python run.py --robot sim               MuJoCo twin (start ./sim_tools/run.sh twin_server.py first)
   python run.py --image img.jpg [--depth depth.raw]     offline: run on a saved frame
   python run.py --step scan_box|partition|blocks        run only up to that vision step
   dashboard: http://localhost:8800  (--port, --no-dashboard; stays open after the run until Ctrl+C)
@@ -44,12 +45,13 @@ def lan_ip():
 def main():
     ap = argparse.ArgumentParser(description="PAC 2026 partition pick & place")
     ap.add_argument("--config", default=HERE / "config.yaml", type=Path)
-    ap.add_argument("--robot", choices=["mock", "piper"])
+    ap.add_argument("--robot", choices=["mock", "piper", "sim"])
     ap.add_argument("--image", type=Path, help="offline colour image instead of the live camera")
     ap.add_argument("--depth", type=Path, help="offline raw Z16 depth for --image")
     ap.add_argument("--step", choices=["scan_box", "partition", "blocks", "all"], default="all")
     ap.add_argument("--max-blocks", type=int)
     ap.add_argument("--mock-fail-rate", type=float, help="mock robot: chance a grasp misses (tests retries)")
+    ap.add_argument("--sim-host", help="--robot sim: twin server host (default from config)")
     ap.add_argument("--port", type=int, default=8800)
     ap.add_argument("--no-dashboard", action="store_true")
     ap.add_argument("--no-hold", action="store_true", help="exit right after the run (dashboard closes)")
@@ -58,6 +60,8 @@ def main():
     cfg = yaml.safe_load(args.config.read_text())
     if args.robot:
         cfg["robot"]["type"] = args.robot
+    if args.sim_host:
+        cfg["robot"]["sim_host"] = args.sim_host
     if args.mock_fail_rate is not None:
         cfg["robot"]["mock_fail_rate"] = args.mock_fail_rate
     max_blocks = args.max_blocks or cfg["run"]["max_blocks"]

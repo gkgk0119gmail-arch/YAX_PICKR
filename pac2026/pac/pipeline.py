@@ -20,6 +20,8 @@ class Pipeline:
         self.table_z = calib.table_z
         self.picked = []          # offline (static image) only: blocks already used, so they are skipped
         self.retries = 0
+        self.twin = getattr(robot, "twin", False)   # MuJoCo twin: real blocks never move, the sim ones do
+        self.twin_synced = False
 
     def _check_stop(self):
         if self.log.stop_requested:
@@ -115,7 +117,10 @@ class Pipeline:
         if hasattr(self.robot, "over_block"):
             self.robot.over_block = None
         self.robot.move_to(x, y, self.z_safe(box), yaw)
-        if self.cams.static:
+        if self.twin:
+            state = self.robot.cell_state(x, y)
+            self.log.info(f"7. cell {cell.id}: {state} (MuJoCo twin)")
+        elif self.cams.static:
             state = "seated"
             self.log.info(f"7. cell {cell.id}: verification simulated as seated (offline image)")
         else:
@@ -154,7 +159,10 @@ class Pipeline:
                 break
             self._step(3, "running", "블록 찾기")
             blocks = P.find_blocks(self.cams.top(with_depth=False), box, self.hub, cfg, self.log)
-            if self.cams.static:
+            if self.twin and not self.twin_synced:
+                self.robot.sync_scene(box, part, blocks, self.calib, self.block_h)
+                self.twin_synced = True
+            if self.cams.static or self.twin:
                 blocks = [b for b in blocks if all(np.hypot(b.center_px[0] - u, b.center_px[1] - v) > 15
                                                    for u, v in self.picked)]
             if not blocks:
@@ -162,6 +170,7 @@ class Pipeline:
                 break
             target = empty[0]
             g = blocks[0]
+            src = g.center_px                     # g is replaced on a straddle re-grasp
             self.log.metric(target_cell=target.id)
             self.log.overlay(target_cell=target.id)
             self.log.info(f"--- block {placed + 1}: grasp at px ({g.center_px[0]:.0f},{g.center_px[1]:.0f}) "
@@ -172,8 +181,8 @@ class Pipeline:
                 attempts += 1
                 if attempts > max_blocks + cfg["retry"]["pick"]:
                     break
-                if self.cams.static:
-                    self.picked.append(g.center_px)      # offline: give up on this block
+                if self.cams.static or self.twin:
+                    self.picked.append(g.center_px)      # offline / twin: give up on this block
                 continue
 
             state = "dropped"
@@ -200,9 +209,13 @@ class Pipeline:
                 self.log.overlay(cells=P.cells_overlay(part.cells))
             elif state in ("dropped", "empty"):
                 self.log.warn(f"block lost ({state}) -> back to step 3")
+                if self.twin:
+                    self.picked.append(src)       # twin: the sim block left its perceived spot
             else:
                 target.state = state                                   # leave uncertain cells alone
                 self.log.overlay(cells=P.cells_overlay(part.cells))
         self.robot.home()
+        if self.twin:
+            self.robot.report()
         self.log.info(f"DONE: {placed} block(s) seated")
         return {"placed": placed, "grid": f"{part.rows}x{part.cols}", "cells": {c.id: c.state for c in part.cells}}
