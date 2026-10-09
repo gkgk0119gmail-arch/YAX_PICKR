@@ -2,11 +2,22 @@
 # Paths are relative to this file. Values marked "ON SITE" must be measured/checked with the real PiPER.
 
 camera:
-  color_device: 4               # top D435i colour stream (/dev/video4)
-  depth_device: /dev/video0     # top D435i depth stream (Z16)
-  depth_size: [848, 480]
-  depth_unit_m: 0.001           # D435 default; verify with pyrealsense2 when installed
+  # picked by serial (pyrealsense2's, not the USB one lsusb shows); depth is aligned to colour
+  top:                          # D435i over the table
+    serial: "261822074796"
+    color_size: [1280, 720]
+    depth_size: [848, 480]
+    fps: 30
+  wrist:                        # D405 on the gripper — depth and colour MUST share one size
+    serial: "261122276195"
+    color_size: [848, 480]
+    depth_size: [848, 480]
+    fps: 30
   depth_frames: 10              # frames averaged (median) per depth capture
+  profile: camera_profile.yaml  # grey-card exposure/WB per camera (perception-main/gray_card_calib.py)
+  # offline --depth raw Z16 dumps (old V4L2 capture, D435i, not aligned to colour)
+  offline_depth_size: [848, 480]
+  offline_depth_unit_m: 0.001   # D435i 1 mm (the D405 is 0.1 mm; live code reads the scale itself)
 
 models:
   vggt: facebook/VGGT-1B-Commercial

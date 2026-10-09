@@ -1,0 +1,47 @@
+# written by perception-main/gray_card_calib.py — applied by pac/cameras.py on open
+wrist:
+  serial: '261122276195'
+  camera: RealSense D405
+  enable_auto_exposure: 0
+  enable_auto_white_balance: 0
+  exposure: 8333
+  exposure_us: 8333
+  gain: 24
+  white_balance: 3370
+  luma_std_1s: 0.06
+  roi_xywh:
+  - 386
+  - 144
+  - 40
+  - 40
+  calibrated_at: '2026-10-09 15:59:16'
+  card_after:
+    b: 110.7
+    g: 124.3
+    r: 112.4
+    luma: 115.8
+    neutral_error_pct: 7.35
+    spread_pct: 1.8
+top:
+  serial: '261822074796'
+  camera: RealSense D435I
+  enable_auto_exposure: 0
+  enable_auto_white_balance: 0
+  exposure: 83
+  exposure_us: 8300
+  gain: 15
+  white_balance: 3920
+  luma_std_1s: 0.06
+  roi_xywh:
+  - 648
+  - 424
+  - 80
+  - 80
+  calibrated_at: '2026-10-09 16:00:25'
+  card_after:
+    b: 126.4
+    g: 105.2
+    r: 126.8
+    luma: 119.5
+    neutral_error_pct: 11.91
+    spread_pct: 3.7

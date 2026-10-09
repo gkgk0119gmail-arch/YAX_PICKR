@@ -8,7 +8,9 @@ import numpy as np
 @dataclass
 class Frame:
     color: np.ndarray                      # BGR, colour-camera pixels
-    depth_m: Optional[np.ndarray] = None   # RealSense depth (its own pixels, not registered to colour)
+    depth_m: Optional[np.ndarray] = None   # metres; live: aligned to colour (same pixels, same size);
+                                           # offline raw dumps: the depth camera's own pixels
+    intrinsics: Optional[dict] = None      # colour camera fx, fy, cx, cy, distortion (live only)
 
 
 @dataclass

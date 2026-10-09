@@ -13,5 +13,7 @@ this is not legal advice).
 | VGGT-1B-Commercial (`facebook/VGGT-1B-Commercial`) | depth / point map from one RGB image | VGGT License + AUP | ✅ with conditions | gated download. **Do not use `facebook/VGGT-1B` (CC BY-NC 4.0, non-commercial)** |
 | LaMa via IOPaint | inpainting for synthetic training data | Apache-2.0 / MIT | ✅ | data preparation only |
 | piper_sdk (AgileX) | PiPER control over CAN | see AgileX repository | - | |
+| pyrealsense2 (Intel RealSense SDK) | D435i / D405 capture, depth-to-colour alignment | Apache-2.0 | ✅ | |
+| WeGo `graycard.py` (WeGo-Robotics/wego-piper-web) | grey-card colour/brightness calibration logic | Apache-2.0 | ✅ | vendored unmodified in `perception-main/third_party/wego_graycard.py` (Copyright 2026 WeGo Robotics) |
 | transformers, PyTorch, OpenCV, scikit-learn, SciPy | runtime | Apache-2.0 / BSD | ✅ | |
 | Qwen3-VL 2B/4B/8B (optional) | VLM checks, voice commands (planned) | Apache-2.0 | ✅ | Qwen2.5-VL-3B is non-commercial — not used |
