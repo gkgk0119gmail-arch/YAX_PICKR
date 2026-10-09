@@ -57,8 +57,11 @@ def truncation_fix(top_xy, top_px, depth, centre, jaw, l_short, l_long, nominal)
     zt = float(np.median(depth[top_px[:, 1], top_px[:, 0]]))
     blocked = np.zeros((H, W), np.uint8)
     blocked[:8, :], blocked[-8:, :], blocked[:, :8], blocked[:, -8:] = 1, 1, 1, 1      # picture border
-    near = np.isfinite(depth) & (depth > 0.02) & (depth < 0.7 * zt)                    # fingers (closer)
-    blocked |= near.astype(np.uint8)
+    near = (np.isfinite(depth) & (depth > 0.02) & (depth < 0.7 * zt)).astype(np.uint8)    # fingers (closer)
+    n_near, lab_near, st_near, _ = cv2.connectedComponentsWithStats(near)
+    for i in range(1, n_near):                         # only big pieces are fingers; speckle is depth noise
+        if st_near[i, cv2.CC_STAT_AREA] >= 1500:
+            blocked[lab_near == i] = 1
     blocked = cv2.dilate(blocked, np.ones((13, 13), np.uint8)).astype(bool)
     touch = blocked[top_px[:, 1], top_px[:, 0]]
     info = dict(touching_points=int(touch.sum()))
@@ -84,7 +87,7 @@ def truncation_fix(top_xy, top_px, depth, centre, jaw, l_short, l_long, nominal)
     return new, info
 
 
-def check(cam, q_now, tcp, plan_xy, plan_top_z, plan_jaw_deg, nominal=None):
+def check(cam, q_now, tcp, plan_xy, plan_top_z, plan_jaw_deg, nominal=None, square=False):
     pos, R = arm_ik.fk(q_now)
     T_base_flange = np.eye(4)
     T_base_flange[:3, :3], T_base_flange[:3, 3] = R, pos / 1000
@@ -126,7 +129,9 @@ def check(cam, q_now, tcp, plan_xy, plan_top_z, plan_jaw_deg, nominal=None):
     g = np.zeros((int(np.ptp(xy[:, 1])) + 21, int(np.ptp(xy[:, 0])) + 21), np.uint8)
     u = (xy - o).astype(int)
     g[u[:, 1], u[:, 0]] = 1
-    g = cv2.morphologyEx(cv2.dilate(g, np.ones((3, 3), np.uint8)), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    # small closing only: neighbouring blocks stand 1-2 cm apart and their tops must stay separate pieces
+    # (the bubble-wrap crease between them is lower than the 6 mm plane band, a 7 mm closing bridged it)
+    g = cv2.morphologyEx(cv2.dilate(g, np.ones((3, 3), np.uint8)), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
     # a neighbouring block of the same height can fall inside the search window: keep only the piece that
     # holds (or is nearest to) the planned centre, not the largest / merged one
     n_lab, lab, stats, cents = cv2.connectedComponentsWithStats(g)
@@ -160,7 +165,7 @@ def check(cam, q_now, tcp, plan_xy, plan_top_z, plan_jaw_deg, nominal=None):
             cline = cline + (centre - centre_rect)
     jaw_deg = float(np.degrees(np.arctan2(jaw[1], jaw[0]))) % 180
     dj = abs((jaw_deg - plan_jaw_deg + 90) % 180 - 90)
-    if l_long - l_short <= 0.015:      # square top (collide.SQUARE_TOL_M): a 90 deg turn is the same block;
+    if square or l_long - l_short <= 0.015:   # square top (known, or measured): a 90 deg turn is the same block;
         dj = min(dj, 90 - dj)          # a rectangular top turned 90 deg would be gripped across the long side
     off = (centre - np.asarray(plan_xy)) * 1000
     out.update(ok=True, vertical_err_deg=round(vert_err, 1), tool_tilt_deg=round(tool_tilt, 1),

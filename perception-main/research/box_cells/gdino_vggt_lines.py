@@ -59,7 +59,32 @@ def load_vggt():
     return _VGGT["model"]
 
 
-def find_box_multi(img_bgr, prompts=PROMPTS, threshold=0.25, grow=0.03):
+def hollow_check(box, depth_m):
+    """Heights above the table (m) of the inside and of the border of a candidate box, from the RealSense depth
+    (top camera looks about straight down): a partitioned basket is LOW inside (floor) with a high rim; a
+    tight group of blocks is high everywhere. Returns (inside_h, rim_h) or None."""
+    H, W = depth_m.shape
+    x1, y1, x2, y2 = (int(round(v)) for v in box)
+    x1, y1, x2, y2 = max(x1, 0), max(y1, 0), min(x2, W), min(y2, H)
+    if x2 - x1 < 20 or y2 - y1 < 20:
+        return None
+    d = np.where(np.isfinite(depth_m) & (depth_m > 0.1), depth_m, np.nan)
+    gx, gy = int(0.12 * (x2 - x1)), int(0.12 * (y2 - y1))
+    ring = np.zeros((H, W), bool)
+    ring[max(y1 - gy, 0):min(y2 + gy, H), max(x1 - gx, 0):min(x2 + gx, W)] = True
+    ring[y1:y2, x1:x2] = False
+    table = np.nanpercentile(d[ring], 70) if np.isfinite(d[ring]).any() else np.nan     # far = the table
+    cw, ch = (x2 - x1) // 4, (y2 - y1) // 4
+    core = d[y1 + ch:y2 - ch, x1 + cw:x2 - cw]
+    band = np.zeros((H, W), bool)
+    band[y1:y2, x1:x2] = True
+    band[y1 + gy // 2:y2 - gy // 2, x1 + gx // 2:x2 - gx // 2] = False
+    if not (np.isfinite(table) and np.isfinite(core).any() and np.isfinite(d[band]).any()):
+        return None
+    return float(table - np.nanmedian(core)), float(table - np.nanpercentile(d[band], 10))
+
+
+def find_box_multi(img_bgr, prompts=PROMPTS, threshold=0.25, grow=0.03, depth_m=None):
     """Run every prompt, drop table-sized hits, return the highest-confidence box (colour px, grown a
     little) and a report: winning prompt/score and which other prompts found the same box (IoU > 0.8)."""
     from PIL import Image
@@ -89,9 +114,22 @@ def find_box_multi(img_bgr, prompts=PROMPTS, threshold=0.25, grow=0.03):
         return i / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - i)
 
     score, (x1, y1, x2, y2), prompt = max(hits, key=lambda h: h[0])
+    rejected = []
+    if depth_m is not None:                              # the best-scoring HOLLOW box (blocks close together
+        for sc, b, p in sorted(hits, key=lambda h: -h[0]):   # look like a "grid" to Grounding DINO)
+            hc = hollow_check(b, depth_m)
+            if hc is None:
+                continue
+            inside_h, rim_h = hc
+            if inside_h < 0.035 and rim_h > 0.03:
+                score, (x1, y1, x2, y2), prompt = sc, b, p
+                break
+            rejected.append((p, round(sc, 3), round(inside_h * 100, 1), round(rim_h * 100, 1)))
+        if rejected:
+            print(f"Grounding DINO: not hollow (prompt, score, inside cm, rim cm): {rejected}")
     agree = sorted({p for sc, b, p in hits if iou(b, [x1, y1, x2, y2]) > 0.8})
     gx, gy = grow * (x2 - x1), grow * (y2 - y1)
-    report = {"prompt": prompt, "score": round(score, 3), "agreeing_prompts": agree,
+    report = {"prompt": prompt, "score": round(score, 3), "agreeing_prompts": agree, "not_hollow": rejected,
               "all": [(p, round(sc, 3), [round(v) for v in b]) for sc, b, p in sorted(hits, reverse=True)]}
     return [x1 - gx, y1 - gy, x2 + gx, y2 + gy], report
 
@@ -329,7 +367,7 @@ def scan(image=None, prompts=None, no_crop=False, slice_frac=None, margin=0.25, 
     t["capture"] = time.time() - t0
 
     t0 = time.time()
-    roi_c, gd = find_box_multi(color, args.prompt or PROMPTS)
+    roi_c, gd = find_box_multi(color, args.prompt or PROMPTS, depth_m=rs_depth)
     t["grounding_dino"] = time.time() - t0
     if roi_c is None:
         raise SystemExit("Grounding DINO: no box found")

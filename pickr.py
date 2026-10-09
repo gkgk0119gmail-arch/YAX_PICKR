@@ -104,12 +104,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cells", nargs="+", default=["auto"])
     ap.add_argument("--max", type=int, default=16)
-    ap.add_argument("--speed", type=int, default=30, help="moves between poses, percent")
-    ap.add_argument("--line-speed", type=int, default=40, help="straight up/down legs (streamed), percent")
+    ap.add_argument("--speed", type=int, default=60, help="moves between poses, percent")
+    ap.add_argument("--line-speed", type=int, default=70, help="straight up/down legs (streamed), percent")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--wait-hands", action="store_true", help="wait until no hand is in view before the scan")
     ap.add_argument("--collide", action="store_true", help="plan with 3D collision checks (off by default)")
+    ap.add_argument("--cell-look", action="store_true", help="D405 look at each empty cell before fetching a block")
     ap.add_argument("--preview", action="store_true", help="scan only: picture with block (B1..) and cell (#1..) numbers")
     ap.add_argument("--order", help='block->cell from the last preview, e.g. "B2:2,B1:1,B3:4"')
     ap.add_argument("--no-view", action="store_true", help="no live camera window")
@@ -164,6 +165,8 @@ def main():
         argv.append("--wait-hands")
     if args.collide:
         argv.append("--collide")
+    if args.cell_look:
+        argv.append("--cell-look")
     if args.preview:
         argv.append("--preview")
     if args.order:

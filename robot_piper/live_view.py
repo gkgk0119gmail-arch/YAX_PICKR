@@ -217,8 +217,16 @@ def _left(page, d):
         q = np.asarray(c.get("quad_px", []), float)
         n = _state["cell_no"].get(k)
         if len(q) == 4 and (n is not None or not _state["cell_no"]):
-            d.text(P(*q.mean(0)), str(n if n is not None else k), font=_f(26, bold=True), fill=(255, 255, 255),
+            x, y = P(*q.mean(0))
+            d.text((x, y - 6), str(n if n is not None else k), font=_f(26, bold=True), fill=(255, 255, 255),
                    anchor="mm", stroke_width=3, stroke_fill=BG)
+            if n is not None:                            # big = fill order, small = the cell's own number
+                d.text((x, y + 16), f"cell {k}", font=_f(13), fill=MUTED, anchor="mm", stroke_width=2, stroke_fill=BG)
+        elif len(q) == 4 and k not in sc.get("occupied", set()):   # in the grid but no reachable block for it
+            x, y = P(*q.mean(0))
+            d.text((x, y - 8), "-", font=_f(26, bold=True), fill=MUTED, anchor="mm", stroke_width=3, stroke_fill=BG)
+            d.text((x, y + 14), f"cell {k}: no block", font=_f(13), fill=MUTED, anchor="mm", stroke_width=2,
+                   stroke_fill=BG)
     for i, b in _on_table(sc):
         try:
             q = _rect_px(b.get("robot", {}))

@@ -38,8 +38,32 @@ def flange_for_tip(tip_xyz, tcp):
 JOINT_LIM = np.array([[-148, 148], [0, 178], [-168, 0], [-98, 98], [-68, 68], [-165, 165]], float)   # arm limits read 2026-10-09: 150, 0..180, -170..0, 100, 70, 170 (2 deg margin)
 
 
+# PiPER DH table of the SDK (C_PiperForwardKinematics(0x01), the firmware's offset version)
+_DH_A = (0.0, 0.0, 285.03, -21.98, 0.0, 0.0)
+_DH_ALPHA = (0.0, -np.pi / 2, 0.0, np.pi / 2, -np.pi / 2, np.pi / 2)
+_DH_THETA = (0.0, -np.pi * 172.22 / 180, -102.78 / 180 * np.pi, 0.0, 0.0, 0.0)
+_DH_D = (123.0, 0.0, 0.0, 250.75, 0.0, 91.0)
+_CA, _SA = np.cos(_DH_ALPHA), np.sin(_DH_ALPHA)
+
+
 def fk(q_deg):
-    """PiPER SDK forward kinematics -> flange (mm) and rotation matrix."""
+    """PiPER forward kinematics -> flange (mm) and rotation matrix. Same DH chain as the SDK's CalFK
+    (checked equal to 1e-9), about 10x faster: called thousands of times by every IK solve."""
+    th = np.radians(np.asarray(q_deg, float)) + _DH_THETA
+    ct, st = np.cos(th), np.sin(th)
+    T = np.eye(4)
+    for i in range(6):
+        ca, sa, a, d = _CA[i], _SA[i], _DH_A[i], _DH_D[i]
+        L = np.array([[ct[i], -st[i], 0.0, a],
+                      [st[i] * ca, ct[i] * ca, -sa, -sa * d],
+                      [st[i] * sa, ct[i] * sa, ca, ca * d],
+                      [0.0, 0.0, 0.0, 1.0]])
+        T = T @ L
+    return T[:3, 3].copy(), T[:3, :3].copy()
+
+
+def fk_sdk(q_deg):
+    """The SDK's own forward kinematics (reference for fk)."""
     from piper_sdk.kinematics.piper_fk import C_PiperForwardKinematics
     f = C_PiperForwardKinematics(0x01).CalFK([np.radians(v) for v in q_deg])[-1]
     return np.array(f[:3]), Rot.from_euler("xyz", f[3:], degrees=True).as_matrix()
@@ -83,7 +107,7 @@ def move_j(p, q_deg, speed, tol_deg=0.5, timeout=40.0, name=None):
             js[1] = (js[1] + 180) % 360 - 180
             err = float(np.abs(js - q_deg).max())
             hist.append(js)
-            if err < tol_deg and len(hist) > 25 and np.ptp(np.array(hist[-25:]), 0).max() < 0.2:
+            if err < tol_deg and len(hist) > 8 and np.ptp(np.array(hist[-8:]), 0).max() < 0.3:
                 ok = True
                 return True, err, st
             time.sleep(0.02)

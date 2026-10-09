@@ -33,7 +33,7 @@ STRAIGHT_TILT = 25.0          # vertical legs, high part: tilt allowed where the
 VERTICAL_TILT = 0.5           # vertical legs, where the fingers are beside a block / inside a cell (deg)
 HOVER_M = 0.06                # start of the straight descent above the block top (D405 check here)
 HOVERS = (HOVER_M, 0.045, 0.03, 0.02, 0.012)   # lower starts where the wrist cannot reach 6 cm above this block
-LINE_S = 0.25                 # straight legs: seconds per cm (4 cm/s)
+LINE_S = 0.12                 # straight legs: seconds per cm (~8 cm/s)
 BLOCK_H_MIN = 0.12            # the blocks are ~90 x 90 x 120 mm: never plan with a lower block (camera may say less)
 BLOCK_H_LYING = 0.09          # a block lying on its side: 90 x 120 mm top, 90 mm high
 
@@ -107,7 +107,7 @@ def scan_basket(frame_dir, finder):
     gvl.share_models(finder.gd_proc, finder.gd, finder.vggt)
     try:
         return gvl.scan(frame_dir / "color.jpg")
-    except SystemExit as e:
+    except (SystemExit, RuntimeError, ValueError, IndexError) as e:   # one bad frame: the next one is tried
         raise SystemExit(f"basket scan failed: {e}")
 
 
@@ -237,7 +237,11 @@ def check_leg(q_a, q_b, tcp, table_z, blocks, carrying, poly, rim_z, cell_xy=Non
     return worst >= 0.0, worst, why
 
 
-SOFT_CLOSE_S = 1.6           # close the gripper over this long (a gentle squeeze of the bubble wrap)
+SOFT_CLOSE_S = 1.2           # close the gripper over this long (a gentle squeeze of the bubble wrap)
+OPEN_EFFORT = 3000            # opening only: a higher effort opens faster (a slow opening dragged the block);
+                              # closing keeps config gripper_effort (soft squeeze)
+CELL_LOOK = False             # empty-gripper D405 look at the next cell before fetching a block (off: the
+                              # calibration is good enough; --cell-look turns it on)
 
 
 def soft_close(p, effort, secs=SOFT_CLOSE_S):
@@ -248,7 +252,7 @@ def soft_close(p, effort, secs=SOFT_CLOSE_S):
         p.GripperCtrl(int(round(w * 1000)), effort, 0x01, 0)
         time.sleep(secs / n)
     t0 = time.time()
-    while time.time() - t0 < 0.8:
+    while time.time() - t0 < 0.4:
         p.GripperCtrl(0, effort, 0x01, 0)
         time.sleep(0.02)
     w = p.GetArmGripperMsgs().gripper_state.grippers_angle / 1000.0
@@ -327,6 +331,18 @@ def regrid_basket(scene, res, guess):
     return (round(move * 1000), round(rot, 1))
 
 
+CELL_BLOCK_RISE_M = 0.075     # a block in a cell stands 9-12 cm high: its top must be this far above the cell floor
+
+
+def block_in_cell(det, cell, pitch):
+    """A detection really is a block standing in this cell: near the cell centre AND tall (the woven basket /
+    an empty cell floor can look like a bubble-wrapped block to Grounding DINO; it is not 9 cm high)."""
+    r = det["robot"]
+    near = np.hypot(*(np.array(r["top_xyz_m"][:2]) - np.array(cell["robot"]["floor_xyz_m"][:2]))) < 0.45 * pitch
+    tall = r["top_xyz_m"][2] > cell["robot"]["floor_xyz_m"][2] + CELL_BLOCK_RISE_M
+    return bool(near and tall and det.get("covered_by_arm", 0) < 0.05)
+
+
 def remeasure(tgt, d, table_z):
     """Take the block pose from a D405 look (centre, jaw, top height, top size) when it looks like one of
     our blocks (short top side 70-110 mm). Returns True if the block was updated."""
@@ -363,7 +379,7 @@ def update_scene_from_obs(scene, res, carried=None, blocks=True, basket=True):
     """Compare a fast top-camera check with what the scene remembers: blocks pushed on the table, the
     basket shifted, cells that got a block. The scene is updated in place; returns what changed."""
     import collide
-    ch = dict(moved=[], basket_shift_mm=None, newly_occupied=[])
+    ch = dict(moved=[], basket_shift_mm=None, newly_occupied=[], new_blocks=[])
     if not res or res.get("error"):
         if res:
             print(f"   [check] skipped: {res['error']}")
@@ -387,48 +403,82 @@ def update_scene_from_obs(scene, res, carried=None, blocks=True, basket=True):
                     print("   [basket] grid did not move - no change")
             else:
                 ch["basket_unsure"] = True
-    # blocks on the table
-    for b in (scene["free"] if blocks else []):
-        if b is carried or b.get("looked") == "ok":         # the D405 look from above beats this frame
-            continue
-        p0 = xy_of(b)
-        # a block partly under the arm comes out shifted / turned: only clear views count
-        near = [d for d in dets if not inside(scene["poly"], xy_of(d)) and np.hypot(*(xy_of(d) - p0)) < 0.08
-                and d.get("covered_by_arm", 0) < 0.05]
-        if not near:
-            continue                                        # not seen (covered): keep the old pose
-        d = min(near, key=lambda o: np.hypot(*(xy_of(o) - p0)))
-        dist = np.hypot(*(xy_of(d) - p0))
-        sym = collide.grip_step(d["robot"].get("size_m"))           # rectangular top: a 90 deg turn matters
-        dyaw = abs(((d["robot"]["jaw_yaw_deg"] - b["robot"]["jaw_yaw_deg"]) + sym / 2) % sym - sym / 2)
-        if dyaw > 30 and dist < 0.02:                # quick RealSense-only fit turned a still block: not trusted
-            dyaw = 0.0
-        if dist > 0.015 or dyaw > 8:
-            b["robot"]["top_xyz_m"][:2] = xy_of(d).tolist()
-            if dyaw > 8:
-                b["robot"]["jaw_yaw_deg"] = d["robot"]["jaw_yaw_deg"]
-            if d["robot"].get("size_m"):
-                b["robot"]["size_m"] = d["robot"]["size_m"]
-            b["robot"]["reach_m"] = float(np.hypot(*xy_of(d)))
-            ch["moved"].append((np.round(p0 * 1000).tolist(), round(dist * 1000), round(dyaw)))
+    # blocks on the table: ONE detection per remembered block (closest pairs first) - two labels must never
+    # end up on the same block
+    if blocks:
+        clear = [d for d in dets if not inside(scene["poly"], xy_of(d)) and d.get("covered_by_arm", 0) < 0.05]
+        rem = [b for b in scene["free"] if b is not carried]
+        pairs = sorted((float(np.hypot(*(xy_of(d) - xy_of(b)))), bi, di)
+                       for bi, b in enumerate(rem) for di, d in enumerate(clear))
+        used_b, used_d = set(), set()
+        for dist, bi, di in pairs:
+            if dist >= 0.08:
+                break
+            if bi in used_b or di in used_d:
+                continue
+            used_b.add(bi)
+            used_d.add(di)
+            b, d = rem[bi], clear[di]
+            if b.get("looked") == "ok":                     # the D405 look from above beats this frame
+                continue
+            p0 = xy_of(b)
+            sym = collide.grip_step(d["robot"].get("size_m"))       # rectangular top: a 90 deg turn matters
+            dyaw = abs(((d["robot"]["jaw_yaw_deg"] - b["robot"]["jaw_yaw_deg"]) + sym / 2) % sym - sym / 2)
+            if dyaw > 30 and dist < 0.02:            # quick RealSense-only fit turned a still block: not trusted
+                dyaw = 0.0
+            if dist > 0.015 or dyaw > 8:
+                b.pop("unpickable", None)                   # moved: worth another try
+                b["robot"]["top_xyz_m"][:2] = xy_of(d).tolist()
+                if dyaw > 8:
+                    b["robot"]["jaw_yaw_deg"] = d["robot"]["jaw_yaw_deg"]
+                if d["robot"].get("size_m"):
+                    b["robot"]["size_m"] = d["robot"]["size_m"]
+                b["robot"]["reach_m"] = float(np.hypot(*xy_of(d)))
+                ch["moved"].append((np.round(p0 * 1000).tolist(), round(dist * 1000), round(dyaw)))
+        # a clear, tall detection far from every remembered block: a block the scene lost - take it back
+        for di, d in enumerate(clear):
+            if di in used_d or d["robot"]["top_xyz_m"][2] - d["robot"].get("table_z_m", 0.0) < 0.06:
+                continue
+            if any(np.hypot(*(xy_of(d) - xy_of(b))) < 0.10 for b in scene["free"]):
+                continue
+            d["order_rank"] = max([b.get("order_rank", 0) for b in scene["free"]] + [0]) + 1
+            scene["free"].append(d)
+            ch["new_blocks"].append(np.round(xy_of(d) * 1000).tolist())
     # cells that hold a block now
     for k, c in scene["num"].items():
         if k in scene["occupied"]:
             continue
         cxy = np.array(c["robot"]["floor_xyz_m"][:2])
-        hit = [d for d in dets if np.hypot(*(xy_of(d) - cxy)) < 0.45 * scene["pitch"]]
+        hit = [d for d in dets if block_in_cell(d, c, scene["pitch"])]
+        flat = [d for d in dets if np.hypot(*(xy_of(d) - cxy)) < 0.45 * scene["pitch"] and d not in hit]
+        if flat and not hit:
+            runlog.event("cell_flat_detection", cell=k, top_z=[d["robot"]["top_xyz_m"][2] for d in flat],
+                         floor_z=c["robot"]["floor_xyz_m"][2])
         if hit:
             scene["occupied"].add(k)
             scene["placed"].append(dict(xy=cxy.copy(), yaw=scene["axis"], top=c["robot"]["floor_xyz_m"][2] + BLOCK_H_MIN))
             ch["newly_occupied"].append(k)
-    if ch["moved"] or ch["basket_shift_mm"] or ch["newly_occupied"]:
+    if ch["moved"] or ch["basket_shift_mm"] or ch["newly_occupied"] or ch["new_blocks"]:
         print(f"   [check {res['secs']:.1f} s] blocks moved {ch['moved']}, basket shift {ch['basket_shift_mm']} mm, "
-              f"newly filled cells {ch['newly_occupied']}")
+              f"newly filled cells {ch['newly_occupied']}, blocks found again {ch['new_blocks']}")
     else:
         print(f"   [check {res['secs']:.1f} s] no change")
     runlog.event("top_check", secs=res.get("secs"), changes=ch, blocks_seen=[xy_of(d) for d in dets],
                  q_now=scene.get("q_now"))
     return ch
+
+
+D405_OUT_MIN_M = 0.01         # the D405 must sit at least this far outside (from the base) and above the tip
+
+
+def d405_outside(q, tcp):
+    """Team rule: the wrist D405 always on the OUTSIDE of the arm (farther from the base than the fingertips)
+    and above them - never turned under / toward the robot."""
+    import collide
+    pos, R = arm_ik.fk(q)
+    cam = R @ collide.T_FLANGE_D405[:3, 3] + pos / 1000
+    tip = arm_ik.tip_of(q, tcp)[0]
+    return bool(np.hypot(*cam[:2]) - np.hypot(*tip[:2]) > D405_OUT_MIN_M and cam[2] - tip[2] > D405_OUT_MIN_M)
 
 
 def plan_place(scene, cell_no, beta, tip_above_bottom, tcp, q_seed=None, cell_xy=None):
@@ -443,7 +493,7 @@ def plan_place(scene, cell_no, beta, tip_above_bottom, tcp, q_seed=None, cell_xy
     cands = []
     for yp in [((scene["axis"] + 90 + k * 90 + 180) % 360) - 180 for k in range(4)]:
         q_try = arm_ik.ik_pose([cxy[0], cxy[1], z_carry], yp, beta, tcp, q_seed)
-        if q_try[1] < 1.5 and q_try[2] < 0.5:
+        if q_try[1] < 1.5 and q_try[2] < 0.5 and d405_outside(q_try[0], tcp):
             cands.append((d405_score(q_try[0], tcp), yp))
     for _, yaw_p in sorted(cands, reverse=True):
         PL = arm_ik.pose_line(cxy, z_carry, z_place, yaw_p, beta, tcp, q_seed=q_seed)
@@ -454,6 +504,10 @@ def plan_place(scene, cell_no, beta, tip_above_bottom, tcp, q_seed=None, cell_xy
 
 class Skip(Exception):
     """This cell cannot be done now (planning / perception); the arm is at rest - go on with the next."""
+
+
+class PickSkip(Skip):
+    """The BLOCK cannot be picked (wrist cannot reach it as measured) - no other cell will change that."""
 
 
 class Halt(Exception):
@@ -537,9 +591,7 @@ def scan_scene(finder, tag="scene"):
     rim_z = summ["robot"]["rim_z_m"]
     objs = finder(color, depth, K)
     blocks = [o for o in objs if o["label"] == "block" and o.get("robot")]
-    occupied = {k for k, c in num.items() if any(
-        np.hypot(*(np.array(b["robot"]["top_xyz_m"][:2]) - np.array(c["robot"]["floor_xyz_m"][:2]))) < 0.45 * pitch
-        for b in blocks)}
+    occupied = {k for k, c in num.items() if any(block_in_cell(b, c, pitch) for b in blocks)}
     free = [b for b in blocks if not inside(poly, b["robot"]["top_xyz_m"][:2])]
     import collide
     in_basket = [dict(xy=np.array(b["robot"]["top_xyz_m"][:2]), yaw=b["robot"]["jaw_yaw_deg"],
@@ -607,13 +659,23 @@ def look_pose(target_xyz, cam_zs, tcp, q_seed=None, min_tip_z=None, max_off_deg=
         yaw_now = float(np.degrees(np.arctan2(Rn[1, 0], Rn[0, 0])))
     cands.sort(key=lambda c: (round((1 - c[0]) * 200), abs((c[1] - yaw_now + 180) % 360 - 180)))
     for cz in cam_zs:
-        for _, yaw, beta, R, zax in cands[:30]:
+        tried = 0
+        for _, yaw, beta, R, zax in cands:
             cam = target + (cz - target[2]) / -zax[2] * -zax           # on the ray through the target
             tip = cam - R @ (cam_f - np.array([0, 0, tcp]))
             if min_tip_z is not None and tip[2] < min_tip_z:
                 continue
+            # known before any IK: the D405 outside / above the tip, and the wrist within the arm's reach
+            if not (np.hypot(*cam[:2]) - np.hypot(*tip[:2]) > D405_OUT_MIN_M and cam[2] - tip[2] > D405_OUT_MIN_M):
+                continue
+            flange = tip - R @ np.array([0, 0, tcp])
+            if np.linalg.norm(flange - np.array([0, 0, 0.123])) > 0.60:
+                continue
+            tried += 1
+            if tried > 12:
+                break
             q, pe, re = arm_ik.ik_pose(tip, yaw, beta, tcp, q_seed)
-            if pe <= 1.5 and re <= 0.5:
+            if pe <= 1.5 and re <= 0.5 and d405_outside(q, tcp):
                 return q, cz
     return None
 
@@ -664,8 +726,16 @@ def look_at_block(tgt, scene, p, args, tcp):
     if not d.get("ok"):
         print(f"[block {tag}] D405 look from above: {d.get('why')} - using the hover check")
         tgt["looked"] = "not seen"
+        tgt["not_seen"] = d.get("why")                     # with an empty grasp next: a ghost label
         return
+    tgt.pop("not_seen", None)
     off = np.hypot(*d["offset_mm"])
+    nom = [v * 1000 for v in block_nominal(r)]
+    if max(d.get("size_mm") or [0]) > nom[1] + 15:        # bigger than one block: tops of neighbours merged
+        print(f"[block {tag}] D405 look from above: top {d.get('size_mm')} mm is larger than one block "
+              f"{nom} - neighbours merged, keeping the top-camera pose")
+        tgt["looked"] = "merged"
+        return
     if d.get("truncation", {}).get("fix_mm"):                # partly hidden even from up here: nominal size
         d = dict(d, size_mm=[round(v * 1000) for v in block_nominal(r)])
     if off > 60 or not remeasure(tgt, d, table_z):
@@ -677,6 +747,15 @@ def look_at_block(tgt, scene, p, args, tcp):
     print(f"[block {tag}] D405 look from above ({(cz - top_z) * 100:.0f} cm over the top): centre moved "
           f"{d['offset_mm']} mm, jaw {d['jaw_deg']:.0f} deg, top z {d['top_z_m'] * 1000:.0f} mm, size {d['size_mm']} mm"
           + (f", partly hidden {d['truncation']}" if d.get("truncation", {}).get("fix_mm") else ""))
+
+
+def refresh_blocks(scene):
+    """Block positions from the top-camera check started when the arm left the last cell (arm over the basket,
+    blocks in clear view). The basket itself is hidden by the arm in that frame: not used for it."""
+    obs = scene.get("obs")
+    if obs is not None and obs.pending():
+        print("   [check] top camera, arm over the basket: block positions ...", end=" ")
+        update_scene_from_obs(scene, obs.wait(), carried=None, basket=False)
 
 
 def survey_cell(k, scene, p, args, tcp):
@@ -733,21 +812,65 @@ def survey_cell(k, scene, p, args, tcp):
               f"top-camera centre")
 
 
+def far_point_on_axis(scene, margin_px=20):
+    """O: on the robot's forward axis (base +x, y = 0) at table height, the farthest point the top camera still
+    sees (inside the picture, margin_px from its edge)."""
+    from observer import project
+    K = scene["K"]
+    W, H = K.get("width", 1280), K.get("height", 720)
+    tz = float(np.median([b["robot"]["table_z_m"] for b in scene["free"]])) if scene["free"] else 0.0
+    xs = np.arange(0.10, 1.50, 0.005)
+    uv = project(np.c_[xs, np.zeros_like(xs), np.full_like(xs, tz)], K)
+    inside = (uv[:, 0] > margin_px) & (uv[:, 0] < W - margin_px) & (uv[:, 1] > margin_px) & (uv[:, 1] < H - margin_px)
+    return np.array([float(xs[inside].max()) if inside.any() else 0.5, 0.0])
+
+
+def assign_block_order(scene):
+    """Team rule for the blocks, fixed once per scan: block 1 = the one nearest O (far end of the robot's forward
+    axis in the top view); then the others by distance from block 1."""
+    O = far_point_on_axis(scene)
+    bxy = lambda b: np.array(b["robot"]["top_xyz_m"][:2])
+    blocks = list(scene["free"])
+    if not blocks:
+        return
+    first = min(blocks, key=lambda b: np.hypot(*(bxy(b) - O)))
+    p1 = bxy(first)
+    for i, b in enumerate(sorted(blocks, key=lambda b: np.hypot(*(bxy(b) - p1))), 1):
+        b["order_rank"] = i
+    scene["order_O"] = O
+    print(f"[order] O = ({O[0] * 1000:.0f}, {O[1] * 1000:.0f}) mm (far end of the forward axis in the top view); block 1 = "
+          f"({p1[0] * 1000:.0f}, {p1[1] * 1000:.0f}), then by distance from it: "
+          + ", ".join(f"{b['order_rank']}:({bxy(b)[0] * 1000:.0f},{bxy(b)[1] * 1000:.0f})"
+                      for b in sorted(blocks, key=lambda b: b["order_rank"])))
+
+
 def team_rule(scene, empty, blocks):
-    """Team rule for one round: blocks sorted nearest-first to the centre of the empty cells, and for a block
-    the empty cells ranked by depth along its direction (block -> centre). Returns (blocks sorted, rank)."""
+    """Team rule for one round. Blocks: the fixed order of assign_block_order (block 1 nearest O, then by
+    distance from block 1). Cells: the robot's
+    forward axis (base +x, straight ahead of the arm) and the line robot origin -> cell centre; the empty cell
+    with the LARGEST angle between them is filled first (ties: the farther cell first). Returns (blocks, rank, C)."""
     cxy = {k: np.array(scene["num"][k]["robot"]["floor_xyz_m"][:2]) for k in empty}
     C = np.mean(list(cxy.values()), axis=0)                  # centre of the remaining cells' centres
+    ax = np.array([1.0, 0.0])                                # the robot's forward axis (base +x)
     bxy = lambda b: np.array(b["robot"]["top_xyz_m"][:2])
 
-    def rank(blk):
-        vh = (C - bxy(blk)) / max(np.linalg.norm(C - bxy(blk)), 1e-9)
-        return sorted(empty, key=lambda k: (-float((cxy[k] - C) @ vh), -float(np.hypot(*(cxy[k] - bxy(blk))))))
-    return sorted(blocks, key=lambda b: np.hypot(*(bxy(b) - C))), rank, C
+    def angle(k):
+        v = cxy[k] / max(np.linalg.norm(cxy[k]), 1e-9)
+        return float(np.degrees(np.arccos(np.clip(v @ ax, -1, 1))))
+
+    order = sorted(empty, key=lambda k: (-round(angle(k), 1), -float(np.hypot(*cxy[k]))))
+    scene["cell_angles"] = {k: round(angle(k), 1) for k in empty}
+
+    def rank(blk):                                           # the same for every block
+        return list(order)
+    if any("order_rank" not in b for b in scene.get("free", [])):
+        assign_block_order(scene)
+    return sorted(blocks, key=lambda b: b.get("order_rank", 1e9)), rank, C
 
 
 def pickable(scene):
-    return [b for b in scene["free"] if 0.15 < b["robot"]["reach_m"] < 0.55 and b["robot"]["fits_gripper"]]
+    return [b for b in scene["free"] if 0.15 < b["robot"]["reach_m"] < 0.55 and b["robot"]["fits_gripper"]
+            and not b.get("unpickable")]
 
 
 def planned_order(scene, want):
@@ -828,7 +951,8 @@ def run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, only_block=N
                                         top=cell_floor + block_height(tgt["robot"])))
             scene["occupied"].add(placed_cell)
         return dict(cell=placed_cell, run=str(run), **res)
-    raise Skip(f"no block could be planned ({last_err})")
+    raise (PickSkip if isinstance(last_err, PickSkip) and only_block is not None else Skip)(
+        f"no block could be planned ({last_err})")
 
 
 BETAS = [0, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24, -24, 28, -28, 32, -32]   # tool tilt about the jaw axis
@@ -841,7 +965,7 @@ def extend_up(xy, z_from, z_max, yaw, beta, tcp, q_from):
     qs, z, seed = [q_from], z_from, q_from
     while z + STEP_M <= z_max + 1e-9:
         z += STEP_M
-        q, pe, re = arm_ik.ik_pose([xy[0], xy[1], z], yaw, beta, tcp, seed)
+        q, pe, re = arm_ik.ik_pose([xy[0], xy[1], z], yaw, beta, tcp, seed, quick=True)
         if pe > 1.5 or re > 0.5:
             break
         qs.append(q)
@@ -912,6 +1036,25 @@ def d405_score(q, tcp):
     return float((cam[2] - tip[2]) + 0.5 * (np.hypot(*cam[:2]) - np.hypot(*tip[:2])))
 
 
+ENTRY_CLEAR_M = 0.01          # the held block must pass this far above other blocks while it is carried in and
+                              # joint 5 turns back over the cell (the turn swings it ~15 cm sideways and down)
+
+
+def entry_clearance(q_lift, q_cell, tcp, carried, scene_c, skip_block, need_z):
+    """Smallest clearance (m) between the held block and the other blocks on the way in: tuck at the lift point,
+    carry with joint 5 tucked, joint 5 back above the cell (the joint-5 turn sweeps the block sideways while it
+    sinks - this is where it hit placed blocks). Returns (clearance, tuck poses)."""
+    tk = tuck_poses(q_lift, q_cell, tcp, carried, need_z)
+    path = [tk[0] + (tk[1] - tk[0]) * f for f in np.linspace(0, 1, 8)] + \
+           [tk[1] + (np.asarray(q_cell) - tk[1]) * f for f in np.linspace(0, 1, 10)]
+    worst = np.inf
+    for q in path:
+        pos, R = arm_ik.fk(q)
+        c, _ = scene_c.clearance(carried @ R.T + pos / 1000, skip_block=skip_block, walls=False)
+        worst = min(worst, c)
+    return worst, tk
+
+
 D405_MAX_OFF_MM = 40          # up to this the D405 (close up) wins and the grasp line is corrected on the spot
 
 
@@ -952,11 +1095,16 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
           f"{np.hypot(*pick_xy) * 1000:.0f} mm from the base; carry tip z {z_carry * 1000:.0f} mm")
     plan, forced, reasons = None, None, []
     pick_ok, place_ok = set(), set()                      # tilts that work at the block / at the cell
+    best_entry = None                                      # least-bad way in, if none keeps the clearance
+    d405_in = set()                                        # tilts dropped only because the D405 would be inside
     for beta in BETAS:
         feas = []
         for yaw_g in yaws_g:
             q_try = arm_ik.ik_pose([pick_xy[0], pick_xy[1], z_grasp + 0.02], yaw_g, beta, tcp)
             if q_try[1] < 1.5 and q_try[2] < 0.5:
+                if not d405_outside(q_try[0], tcp):
+                    d405_in.add(beta)
+                    continue
                 feas.append((d405_score(q_try[0], tcp), yaw_g))
         for _, yaw_g in sorted(feas, reverse=True):            # D405 up and outside the arm first
             key = (id(tgt), beta, yaw_g, len(scene_c.blocks), round(top_z, 3), tuple(np.round(pick_xy, 3)),
@@ -990,7 +1138,7 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             place_order = []
             for yp in yaws_p:
                 q_try = arm_ik.ik_pose([cell_xy[0], cell_xy[1], z_carry], yp, beta, tcp)
-                if q_try[1] < 1.5 and q_try[2] < 0.5:
+                if q_try[1] < 1.5 and q_try[2] < 0.5 and d405_outside(q_try[0], tcp):
                     place_order.append((d405_score(q_try[0], tcp), yp))
             for z_carry, yaw_p in [(zc, yp) for zc in z_carries for _, yp in sorted(place_order, reverse=True)]:
                 PL = arm_ik.pose_line(cell_xy, z_carry, z_place, yaw_p, beta, tcp)
@@ -999,6 +1147,18 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                 place_ok.add(beta)
                 # the cell side as high as the wrist reaches too: carry high, then straight down
                 PLup = extend_up(cell_xy, z_carry, z_max, yaw_p, beta, tcp, PL[0])
+                # the way in: the joint-5 turn over the cell must keep the held block above the other blocks;
+                # a larger grasp tilt lets the upright block stay higher over the cell (more room for the turn)
+                e_clr, _ = entry_clearance(Lup[-1], PLup[-1], tcp, carried, scene_c, tgt_idx,
+                                           max(tops) + TUCK_CLEAR)
+                if e_clr < ENTRY_CLEAR_M:
+                    reasons.append(f"tilt {beta}: joint 5 turning back over the cell brings the held block "
+                                   f"{e_clr * 1000:.0f} mm from another block")
+                    if best_entry is None or e_clr > best_entry[0]:
+                        best_entry = (e_clr, dict(beta=beta, yaw_g=yaw_g, yaw_p=yaw_p, L=L, Lup=Lup, PL=PL,
+                                                  PLup=PLup, carried=carried, z_top=z_top,
+                                                  legs=pick_checks, worst=min(c for _, c, _ in pick_checks)))
+                    continue
                 down_cell = PLup[::-1] + PL[1:]
                 legs = [("to above block", [start_q, L[0]], 0.10, None, None),
                         ("carry to cell (high)", [Lup[-1], PLup[-1]], 0.08, carried, tgt_idx),
@@ -1023,6 +1183,10 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                 break
         if plan:
             break
+    if plan is None and forced is None and best_entry is not None:
+        plan = best_entry[1]
+        print(f"   NO way in keeps the held block {ENTRY_CLEAR_M * 1000:.0f} mm above the other blocks - using the best "
+              f"one ({best_entry[0] * 1000:.0f} mm, tilt {plan['beta']:+d})")
     if plan is None and forced is not None:
         plan = forced
         print("   NO collision-free plan - running the least-bad one (touches other blocks): "
@@ -1030,6 +1194,9 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
     if plan is None:
         if reasons:
             why = reasons[-1]
+        elif not pick_ok and d405_in:
+            why = (f"the block is reachable only with the D405 turned inside / under the gripper (tilts "
+                   f"{sorted(d405_in)}) - not allowed")
         elif not pick_ok:
             why = f"the wrist cannot reach the block with the jaws across its short side (jaw {r['jaw_yaw_deg']:.0f} deg)"
         else:
@@ -1037,7 +1204,7 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                    f"any of them (it is released with the same tilt)")
         runlog.event("no_plan", cell=cell_no, block=pick_xy, jaw=r["jaw_yaw_deg"], size=r.get("size_m"), H=H,
                      pick_ok=sorted(pick_ok), place_ok=sorted(place_ok), why=why)
-        raise Skip(f"no tilt up to 32 deg works for this block ({np.hypot(*pick_xy) * 1000:.0f} mm from the "
+        raise (PickSkip if not pick_ok else Skip)(f"no tilt up to 32 deg works for this block ({np.hypot(*pick_xy) * 1000:.0f} mm from the "
                    f"base): {why}")
     is_forced = "bad" in plan
     L, PL, beta = plan["L"], plan["PL"], plan["beta"]
@@ -1131,13 +1298,14 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             _, jh, _ = ht.read(p)
             jh[1] = (jh[1] + 180) % 360 - 180
             obs.start(jh, tcp, holding=False)
-        gripper(p, RELEASE_MM, effort)                       # fully open (100 mm) before going down
+        gripper(p, RELEASE_MM, OPEN_EFFORT, secs=0.5)             # fully open (100 mm) before going down
         d405 = None
         if wrist:                                            # D405: centred? (tilt = beta is expected)
             from wrist_check import check
             _, jn, _ = ht.read(p)
             jn[1] = (jn[1] + 180) % 360 - 180
-            d405, vis = check(wrist.cam, jn, tcp, pick_xy, top_z, r["jaw_yaw_deg"], nominal=block_nominal(r))
+            d405, vis = check(wrist.cam, jn, tcp, pick_xy, top_z, r["jaw_yaw_deg"], nominal=block_nominal(r),
+                              square=collide.is_square(r.get("size_m")))
             runlog.event("d405_block", plan_xy=pick_xy, plan_top_z=top_z, plan_jaw=r["jaw_yaw_deg"], q=jn, run=str(run),
                          **d405)
             if vis is not None:
@@ -1189,13 +1357,18 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
         w = soft_close(p, effort)
         print(f"   gripper closed at {w:.0f} mm")
         if not HOLD_MM[0] <= w <= HOLD_MM[1]:
-            gripper(p, RELEASE_MM, effort)
+            gripper(p, RELEASE_MM, OPEN_EFFORT)
             line("back up", L[::-1])
             _, jn, _ = ht.read(p)
             jn[1] = (jn[1] + 180) % 360 - 180
             if scene is not None:                            # no trip to rest: re-plan from up here
                 scene["q_now"] = jn
             tgt["looked"] = None                             # the next attempt looks from above again
+            if w < 10 and tgt.get("not_seen") and scene is not None and tgt in scene["free"]:
+                scene["free"].remove(tgt)                    # nothing seen there from above, nothing gripped
+                runlog.event("ghost_removed", block=pick_xy, why=tgt["not_seen"])
+                raise Skip(f"no block at ({pick_xy[0] * 1000:.0f}, {pick_xy[1] * 1000:.0f}): the D405 saw none from "
+                           f"above and the gripper closed on nothing - label removed")
             if wrist and tgt.get("tries", 0) < 2:           # look again from up here, then plan with what is seen
                 from wrist_check import check
                 tgt["tries"] = tgt.get("tries", 0) + 1
@@ -1240,7 +1413,7 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             mv("back to the pick spot (tucked)", tk[0])
             mv("back to the pick spot", Lup[-1])
             line("put the block back", Lup[::-1] + L[1:])
-            gripper(p, RELEASE_MM, effort, secs=1.5)
+            gripper(p, RELEASE_MM, OPEN_EFFORT, secs=0.7)
             time.sleep(0.5)
             line("up from the put-back block", L[::-1] + Lup[1:])
             _, jb, _ = ht.read(p)
@@ -1253,7 +1426,7 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
         mv("above cell (high)", PLup[-1])
         placed_cell, place_xy = cell_no, np.asarray(cell_xy, float)
         if obs is not None:
-            ch = update_scene_from_obs(scene, obs.wait(), carried=tgt)
+            ch = update_scene_from_obs(scene, obs.wait(), carried=tgt, blocks=False)   # arm over the blocks
             if ch["basket_shift_mm"] or cell_no in scene["occupied"]:
                 if cell_no in scene["occupied"]:             # someone filled it: take the next empty cell
                     free_cells = sorted([k for k in scene["num"] if k not in scene["occupied"]],
@@ -1277,6 +1450,10 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                 PL, PLup, _, place_xy, cell_floor = pp
                 print(f"   re-planned the placement into cell {placed_cell}")
                 mv("above cell (updated)", PLup[-1])
+        if obs is not None:                                  # arm over the basket now: the table is in clear view -
+            _, jo, _ = ht.read(p)                            # the next round's block positions, ready in time
+            jo[1] = (jo[1] + 180) % 360 - 180
+            obs.start(jo, tcp, holding=True)
         if wrist:                                            # D405: where is the cell exactly?
             from wrist_check import check_cell
             _, jn, _ = ht.read(p)
@@ -1294,6 +1471,9 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                 looked = scene and scene["num"][placed_cell].get("surveyed") == "corrected"
                 if looked:
                     print("   (the empty-gripper look already set this cell: not moved again)")
+                elif not CELL_LOOK:                          # view mostly hidden by the held block: log only
+                    print("   (cell check while holding: logged only, the cell centre is kept)")
+                    looked = True
                 if 3 < sh < 30 and not looked:
                     pp = plan_place(scene, placed_cell, beta, tip_above_bottom, tcp, q_seed=jn,
                                     cell_xy=cc["centre_xy_m"])
@@ -1304,8 +1484,8 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             else:
                 print(f"   D405 cell check skipped: {cc.get('why')}")
         line("down into cell", PLup[::-1] + PL[1:])
-        gripper(p, RELEASE_MM, effort, secs=1.5)
-        time.sleep(1.0)
+        gripper(p, RELEASE_MM, OPEN_EFFORT, secs=0.7)
+        time.sleep(0.3)
         line("up out of cell", PL[::-1] + PLup[1:])          # the way it came in, reversed: straight up ...
         _, q_end, _ = ht.read(p)
         q_end[1] = (q_end[1] + 180) % 360 - 180
@@ -1314,8 +1494,6 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             q_back[4] = tk[2]
             mv("retreat: joint 5 back up (reverse of the entry)", q_back)
             q_end = q_back
-        if obs is not None:                                  # look at the table while the next pick is planned
-            obs.start(q_end, tcp, holding=False)
         print(f"[cell {placed_cell}] done{' (forced: may have touched another block)' if is_forced else ''}")
         return dict(status="done", grip_mm=round(w), beta=beta, forced=is_forced, d405=d405, end_q=q_end,
                     placed_cell=placed_cell, placed_xy=place_xy)
@@ -1324,182 +1502,260 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
             wrist.close()
 
 
+def safe_rest(p, args):
+    """Ctrl-C during a run: lift the gripper 8 cm straight up if it is low (between blocks / in a cell), then the
+    rest pose at a gentle speed. A second Ctrl-C stops the arm where it is (damped stop)."""
+    from scipy.optimize import least_squares
+    from scipy.spatial.transform import Rotation as Rot
+    from board_hover import go_rest
+    tcp = yaml.safe_load((ROOT / "pac2026" / "config.yaml").read_text())["robot"]["tcp_offset_m"]
+    print("\n[stop] Ctrl+C: going back to the rest pose (Ctrl+C again = stop right here)", flush=True)
+    live_view.status("Ctrl+C: going back to rest")
+    runlog.event("ctrl_c")
+    try:
+        enable(p)
+        _, q, _ = ht.read(p)
+        q[1] = (q[1] + 180) % 360 - 180
+        tip = arm_ik.tip_of(q, tcp)[0]
+        if np.abs(q - REST_Q).max() > 2 and tip[2] < 0.22:     # low: first straight up, same orientation
+            R0 = arm_ik.fk(q)[1]
+            target = tip + [0, 0, 0.08]
+
+            lo, hi = arm_ik.JOINT_LIM[:, 0], arm_ik.JOINT_LIM[:, 1]
+            for w_rot in (200, 20):                          # same orientation; else let the tool tilt a bit
+                def resid(x, w=w_rot):
+                    pos, R = arm_ik.fk(x)
+                    t = (pos + R @ [0, 0, tcp * 1000]) / 1000
+                    return np.r_[(t - target) * 1000, w * Rot.from_matrix(R0.T @ R).as_rotvec()]
+                sol = least_squares(resid, np.clip(q, lo + 1e-3, hi - 1e-3), bounds=(lo, hi))
+                if np.linalg.norm(resid(sol.x)[:3]) < 5:
+                    break
+            if np.linalg.norm(resid(sol.x)[:3]) < 5 and ht.path_min_tip_z(q, sol.x, tcp) > tip[2] * 1000 - 5:
+                ok, err, st = ht.move_j(p, sol.x, 20, name="stop: lift 8 cm")
+                print(f"[stop] lifted 8 cm: {'ok' if ok else 'not reached'}", flush=True)
+        go_rest(p, 20)
+        print("[stop] at rest. If a block is still in the gripper, take it out by hand.", flush=True)
+    except KeyboardInterrupt:
+        p.MotionCtrl_1(0x01, 0, 0)                                # damped stop where it is
+        print("[stop] second Ctrl+C: arm stopped where it is (damped)", flush=True)
+    except SystemExit as e:                                      # go_rest refused (path would dip)
+        print(f"[stop] not moving to rest: {e} - move the arm by hand (teach mode)", flush=True)
+
+
 def main(argv=None, finder=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--cells", nargs="+", default=["auto"],
                     help="cell numbers (robot view: 1 far-left, 2 far-right, 3 near-left, 4 near-right) or 'auto' "
                          "(all empty cells); always filled farthest from the robot first")
     ap.add_argument("--max", type=int, default=16, help="at most this many cells")
-    ap.add_argument("--speed", type=int, default=30, help="moves between poses, percent")
-    ap.add_argument("--line-speed", type=int, default=40, help="controller speed while streaming the straight legs")
+    ap.add_argument("--speed", type=int, default=60, help="moves between poses, percent")
+    ap.add_argument("--line-speed", type=int, default=70, help="controller speed while streaming the straight legs")
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--wait-hands", action="store_true", help="wait until no hand is in view before scanning")
     ap.add_argument("--collide", action="store_true", help="3D collision checks while planning (off by default)")
+    ap.add_argument("--cell-look", action="store_true", help="D405 look at each empty cell before fetching a block")
     ap.add_argument("--preview", action="store_true", help="scan only: picture with block / cell numbers")
     ap.add_argument("--order", help='block->cell pairs from the last preview, e.g. "B2:2,B1:1,B3:4"')
     args = ap.parse_args(argv)
     import collide
     collide.ENABLED = args.collide
+    global CELL_LOOK
+    CELL_LOOK = args.cell_look
     global WAIT_HANDS
     WAIT_HANDS = args.wait_hands
     cfg = yaml.safe_load((ROOT / "pac2026" / "config.yaml").read_text())["robot"]
     tcp, effort, open_mm = cfg["tcp_offset_m"], int(cfg["gripper_effort"]), float(cfg["gripper_open_mm"])
     finder = finder or load_finder()
     p = connect()
-    live_view.set_arm(p)                                    # dashboard: gripper opening
     try:
-        scene = scan_scene(finder)                          # the only scan: coordinates are remembered
-    except (Halt, SystemExit) as e:
-        print(f"[scene] {e}")
-        return [dict(cell="-", status="HALT", why=str(e))]
-    preview_file = ROOT / "pac2026" / "runs" / "preview_latest.json"
-    if args.preview:
-        img = draw_preview(scene)
-        out = ROOT / "pac2026" / "runs" / "preview_latest.png"
-        cv2.imwrite(str(out), img)
-        preview_file.write_text(json.dumps(dict(
-            blocks={f"B{i}": b["robot"]["top_xyz_m"][:2] for i, b in enumerate(scene["free"], 1)},
-            cells={str(k): c["robot"]["floor_xyz_m"][:2] for k, c in scene["num"].items()},
-            occupied=sorted(scene["occupied"])), indent=1))
-        print(f"[preview] {out}")
-        for i, b in enumerate(scene["free"], 1):
-            t = np.array(b["robot"]["top_xyz_m"]) * 1000
-            print(f"   B{i}: ({t[0]:.0f}, {t[1]:.0f}) mm, {np.hypot(*t[:2]) / 10:.0f} cm from the base")
-        return [dict(cell="-", status="preview", why=str(out))]
-    pairs = None
-    if args.order:                                          # "B2:2,B1:1" -> [(block obj, cell), ...]
-        prev = json.loads(preview_file.read_text())
-        pairs = []
-        for item in args.order.replace(" ", "").split(","):
-            bid, cell = item.split(":")
-            pxy = np.array(prev["blocks"][bid.upper()])
-            near = min(scene["free"], key=lambda b: np.hypot(*(np.array(b["robot"]["top_xyz_m"][:2]) - pxy)))
-            if np.hypot(*(np.array(near["robot"]["top_xyz_m"][:2]) - pxy)) > 0.06:
-                raise SystemExit(f"{bid}: no block near its preview position any more - run --preview again")
-            pairs.append((near, int(cell)))
-        print("[order] " + ", ".join(f"{bid} -> cell {c}" for bid, c in
-                                     (it.split(":") for it in args.order.replace(" ", "").split(","))))
-    scene["q_now"] = REST_Q.copy()
-    scene["obs"] = None
-    scene["finder"] = finder                              # grid re-detection when the basket moves
-    if args.go:
-        from observer import Observer
+        live_view.set_arm(p)                                    # dashboard: gripper opening
         try:
-            scene["obs"] = Observer(finder)                 # top camera stays open for the fast checks
-            live_view.set_source("top", scene["obs"].cam.latest, scene["obs"].cam.intrinsics)
-        except Exception as e:
-            print(f"[check] top camera checks unavailable: {e}")
-        try:
-            scene["wrist"] = WristSeen()                    # D405 open for the whole run (checks + live view)
-            live_view.set_source("wrist", scene["wrist"].latest)
-        except Exception as e:
-            scene["wrist"] = None
-            print(f"[check] wrist D405 unavailable: {e}")
-    num = scene["num"]
-    want = sorted(num) if args.cells == ["auto"] else [int(c) for c in args.cells]
-
-    def order(sc):
-        t = [k for k in want if k in sc["num"] and k not in sc["occupied"]]
-        return sorted(t, key=lambda k: -np.hypot(*sc["num"][k]["robot"]["floor_xyz_m"][:2]))   # farthest first
-    todo = order(scene)[:args.max] if pairs is None else [c for _, c in pairs]
-    forced_block = {c: b for b, c in pairs} if pairs else {}
-    print(f"[plan] cells in order (farthest first): {todo}")
-    live_view.plan(list(pairs) if pairs else planned_order(scene, want))   # dashboard numbers = this order
-    results = []
-    for k in [c for c in want if c not in num or c in scene["occupied"]]:
-        results.append(dict(cell=k, status="skipped", why="already has a block" if k in num else "no such cell"))
-    tried = set()
-
-    def to_rest():
-        if not args.go:
-            scene["q_now"] = REST_Q.copy()
-            return
-        from board_hover import go_rest
-        enable(p)
-        go_rest(p, args.speed)
+            scene = scan_scene(finder)                          # the only scan: coordinates are remembered
+        except (Halt, SystemExit) as e:
+            print(f"[scene] {e}")
+            return [dict(cell="-", status="HALT", why=str(e))]
+        preview_file = ROOT / "pac2026" / "runs" / "preview_latest.json"
+        if args.preview:
+            img = draw_preview(scene)
+            out = ROOT / "pac2026" / "runs" / "preview_latest.png"
+            cv2.imwrite(str(out), img)
+            preview_file.write_text(json.dumps(dict(
+                blocks={f"B{i}": b["robot"]["top_xyz_m"][:2] for i, b in enumerate(scene["free"], 1)},
+                cells={str(k): c["robot"]["floor_xyz_m"][:2] for k, c in scene["num"].items()},
+                occupied=sorted(scene["occupied"])), indent=1))
+            print(f"[preview] {out}")
+            for i, b in enumerate(scene["free"], 1):
+                t = np.array(b["robot"]["top_xyz_m"]) * 1000
+                print(f"   B{i}: ({t[0]:.0f}, {t[1]:.0f}) mm, {np.hypot(*t[:2]) / 10:.0f} cm from the base")
+            return [dict(cell="-", status="preview", why=str(out))]
+        pairs = None
+        if args.order:                                          # "B2:2,B1:1" -> [(block obj, cell), ...]
+            prev = json.loads(preview_file.read_text())
+            pairs = []
+            for item in args.order.replace(" ", "").split(","):
+                bid, cell = item.split(":")
+                pxy = np.array(prev["blocks"][bid.upper()])
+                near = min(scene["free"], key=lambda b: np.hypot(*(np.array(b["robot"]["top_xyz_m"][:2]) - pxy)))
+                if np.hypot(*(np.array(near["robot"]["top_xyz_m"][:2]) - pxy)) > 0.06:
+                    raise SystemExit(f"{bid}: no block near its preview position any more - run --preview again")
+                pairs.append((near, int(cell)))
+            print("[order] " + ", ".join(f"{bid} -> cell {c}" for bid, c in
+                                         (it.split(":") for it in args.order.replace(" ", "").split(","))))
         scene["q_now"] = REST_Q.copy()
+        scene["obs"] = None
+        scene["finder"] = finder                              # grid re-detection when the basket moves
+        if args.go:
+            from observer import Observer
+            try:
+                scene["obs"] = Observer(finder)                 # top camera stays open for the fast checks
+                live_view.set_source("top", scene["obs"].cam.latest, scene["obs"].cam.intrinsics)
+            except Exception as e:
+                print(f"[check] top camera checks unavailable: {e}")
+            try:
+                scene["wrist"] = WristSeen()                    # D405 open for the whole run (checks + live view)
+                live_view.set_source("wrist", scene["wrist"].latest)
+            except Exception as e:
+                scene["wrist"] = None
+                print(f"[check] wrist D405 unavailable: {e}")
+        num = scene["num"]
+        want = sorted(num) if args.cells == ["auto"] else [int(c) for c in args.cells]
 
-    rounds = 0
-    while pairs is None and want and rounds < args.max:     # team rule: block nearest the empty cells,
-        rounds += 1                                         # into the cell farthest along its direction
-        empty = [k for k in want if k in scene["num"] and k not in scene["occupied"]]
-        blocks = pickable(scene)
-        if not empty or not blocks:
-            print(f"[order] done: empty cells {empty}, blocks left {len(blocks)}")
-            break
-        bxy = lambda b: np.array(b["robot"]["top_xyz_m"][:2])
-        done_round = False
-        ordered, rank, C = team_rule(scene, empty, blocks)
-        for blk in ordered:
-            ranked = rank(blk)
-            print(f"[order] block at {np.round(bxy(blk) * 1000).tolist()} mm ({np.hypot(*(bxy(blk) - C)) * 1000:.0f} mm "
-                  f"from the cells' centre) -> cells by depth along its direction {ranked}")
-            for k in ranked:
+        def order(sc):
+            t = [k for k in want if k in sc["num"] and k not in sc["occupied"]]
+            return sorted(t, key=lambda k: -np.hypot(*sc["num"][k]["robot"]["floor_xyz_m"][:2]))   # farthest first
+        todo = order(scene)[:args.max] if pairs is None else [c for _, c in pairs]
+        forced_block = {c: b for b, c in pairs} if pairs else {}
+        if pairs is None:                                       # what the team rule will do if every round succeeds
+            po = planned_order(scene, want)
+            print("[plan] fill order (block order from O -> cell at the largest angle from the robot's forward axis): "
+                  + ", ".join(f"block ({b['robot']['top_xyz_m'][0] * 1000:.0f}, {b['robot']['top_xyz_m'][1] * 1000:.0f}) -> "
+                              f"cell {k}" for b, k in po))
+            out_of = [b for b in scene["free"] if b not in pickable(scene)]
+            for b in out_of:
+                t = np.array(b["robot"]["top_xyz_m"][:2]) * 1000
+                why = (f"{b['robot']['reach_m'] * 100:.0f} cm from the base (reach 15-55 cm)"
+                       if not 0.15 < b["robot"]["reach_m"] < 0.55 else "too wide for the gripper")
+                print(f"[plan] block ({t[0]:.0f}, {t[1]:.0f}) is NOT used: {why} - move it closer if it is needed")
+            left = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in [c for _, c in po]]
+            if left:
+                print(f"[plan] cells {left} will stay EMPTY: not enough reachable blocks")
+        else:
+            print(f"[plan] cells in the given order: {todo}")
+        live_view.plan(list(pairs) if pairs else planned_order(scene, want))   # dashboard numbers = this order
+        results = []
+        for k in [c for c in want if c not in num or c in scene["occupied"]]:
+            results.append(dict(cell=k, status="skipped", why="already has a block" if k in num else "no such cell"))
+        tried = set()
+
+        def to_rest():
+            if not args.go:
+                scene["q_now"] = REST_Q.copy()
+                return
+            from board_hover import go_rest
+            enable(p)
+            go_rest(p, args.speed)
+            scene["q_now"] = REST_Q.copy()
+
+        rounds = 0
+        fails = {}                                          # id(block) -> failed tries (tried again later)
+        dead_cells = set()                                  # cells no block could go into
+        while pairs is None and want and rounds < args.max:     # team rule: cells in their fixed order, each
+            rounds += 1                                         # gets the next block in the block order
+            empty = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in dead_cells]
+            blocks = pickable(scene)
+            if not empty or not blocks:
+                print(f"[order] done: empty cells {empty}, blocks left {len(blocks)}")
+                break
+            bxy = lambda b: np.array(b["robot"]["top_xyz_m"][:2])
+            ordered, rank, C = team_rule(scene, empty, blocks)
+            cell = rank(None)[0]                                # the next cell of the fill order
+            # blocks in their order; one that failed goes behind the others and is tried again later
+            ordered = sorted(ordered, key=lambda b: (fails.get(id(b), 0), b.get("order_rank", 1e9)))
+            done_round = False
+            for blk in ordered:
+                if blk not in scene["free"]:                    # removed meanwhile (ghost / placed)
+                    continue
+                print(f"[order] cell {cell} ({scene['cell_angles'][cell]} deg from straight ahead) <- block "
+                      f"{blk.get('order_rank')} at {np.round(bxy(blk) * 1000).tolist()} mm"
+                      + (f" (retry {fails[id(blk)]})" if fails.get(id(blk)) else ""))
                 try:
-                    survey_cell(k, scene, p, args, tcp)     # empty gripper: measure the cell first
-                    r = run_cell(k, scene, p, finder, args, tcp, effort, open_mm, blk)
+                    if CELL_LOOK:
+                        survey_cell(cell, scene, p, args, tcp)  # empty gripper: measure the cell first
+                    else:
+                        refresh_blocks(scene)                   # top camera, taken with the arm over the basket
+                    r = run_cell(cell, scene, p, finder, args, tcp, effort, open_mm, blk)
                     results.append(r)
                     done_round = True
                     break
-                except Skip as e:
-                    print(f"   cell {k} with this block: {e}")
+                except Skip as e:                               # this block: the next one goes into this cell
+                    fails[id(blk)] = fails.get(id(blk), 0) + 1
+                    print(f"   block {blk.get('order_rank')} not done ({e}) - the next block goes into cell {cell}"
+                          f"; this one is tried again later")
+                    if fails[id(blk)] >= 2:
+                        blk["unpickable"] = str(e)
+                        print(f"   block {blk.get('order_rank')}: failed twice - left out (until it is seen moved)")
                 except Halt as e:
-                    print(f"[cell {k}] HALT: {e}")
-                    results.append(dict(cell=k, status="HALT", why=str(e)))
-                    want = []                               # stop the whole run
+                    print(f"[cell {cell}] HALT: {e}")
+                    results.append(dict(cell=cell, status="HALT", why=str(e)))
+                    want = []                                   # stop the whole run
                     done_round = True
                     break
-            if done_round:
+            if not done_round:
+                dead_cells.add(cell)
+                print(f"[order] no block could go into cell {cell} - it stays empty, next cell")
+                results.append(dict(cell=cell, status="skipped", why="no block could be placed in it"))
+        while pairs is not None and todo and len(tried) < args.max:
+            cell_no = todo.pop(0)
+            tried.add(cell_no)
+            try:
+                if CELL_LOOK:
+                    survey_cell(cell_no, scene, p, args, tcp)
+                else:
+                    refresh_blocks(scene)
+                r = run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, forced_block.get(cell_no))
+                results.append(r)
+                if pairs is None:
+                    todo = [k for k in order(scene) if k not in tried]   # cells may have been filled meanwhile
+            except Skip as e:
+                print(f"[cell {cell_no}] SKIPPED: {e}")
+                results.append(dict(cell=cell_no, status="skipped", why=str(e)))
+                if "no block left" in str(e):
+                    break
+            except Halt as e:
+                print(f"[cell {cell_no}] HALT: {e}")
+                results.append(dict(cell=cell_no, status="HALT", why=str(e)))
                 break
-        if not done_round:
-            results.append(dict(cell="-", status="skipped", why="no reachable block / cell pair left"))
-            break
-    while pairs is not None and todo and len(tried) < args.max:
-        cell_no = todo.pop(0)
-        tried.add(cell_no)
-        try:
-            survey_cell(cell_no, scene, p, args, tcp)
-            r = run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, forced_block.get(cell_no))
-            results.append(r)
-            if pairs is None:
-                todo = [k for k in order(scene) if k not in tried]   # cells may have been filled meanwhile
-        except Skip as e:
-            print(f"[cell {cell_no}] SKIPPED: {e}")
-            results.append(dict(cell=cell_no, status="skipped", why=str(e)))
-            if "no block left" in str(e):
-                break
-        except Halt as e:
-            print(f"[cell {cell_no}] HALT: {e}")
-            results.append(dict(cell=cell_no, status="HALT", why=str(e)))
-            break
-    live_view.targets()
-    if scene.get("obs") is not None:
-        update_scene_from_obs(scene, scene["obs"].wait(), carried=None)
-    if args.go and np.abs(np.asarray(scene["q_now"]) - REST_Q).max() > 1:
-        live_view.status("back to rest")
-        to_rest()                                           # only at the very end
-        try:
-            w = scene.get("wrist") or WristSeen()
-            h, nf = w.holding()
-            print(f"[end] at rest: wrist near fraction {nf:.2f} -> {'BLOCK STILL ON THE GRIPPER' if h else 'gripper empty'}")
-        except Exception:
-            pass
-        gripper(p, 0, effort)
-    live_view.status(f"finished: {sum(r['status'] == 'done' for r in results)} cell(s) filled")
-    time.sleep(0.3)
-    live_view.set_source("top", None)
-    live_view.set_source("wrist", None)
-    if scene.get("obs") is not None:
-        scene["obs"].close()
-    if scene.get("wrist") is not None:
-        scene["wrist"].close()
-    print("\n===== summary =====")
-    for r in results:
-        extra = r.get("why") or (f"grip {r.get('grip_mm')} mm" if r["status"] == "done" else "")
-        if r.get("forced"):
-            extra += "  [forced: collision with a block was expected]"
-        print(f"  cell {r['cell']}: {r['status']:8s} {extra}")
-    return results
+        live_view.targets()
+        if scene.get("obs") is not None:
+            update_scene_from_obs(scene, scene["obs"].wait(), carried=None)
+        if args.go and np.abs(np.asarray(scene["q_now"]) - REST_Q).max() > 1:
+            live_view.status("back to rest")
+            to_rest()                                           # only at the very end
+            try:
+                w = scene.get("wrist") or WristSeen()
+                h, nf = w.holding()
+                print(f"[end] at rest: wrist near fraction {nf:.2f} -> {'BLOCK STILL ON THE GRIPPER' if h else 'gripper empty'}")
+            except Exception:
+                pass
+            gripper(p, 0, effort)
+        live_view.status(f"finished: {sum(r['status'] == 'done' for r in results)} cell(s) filled")
+        time.sleep(0.3)
+        live_view.set_source("top", None)
+        live_view.set_source("wrist", None)
+        if scene.get("obs") is not None:
+            scene["obs"].close()
+        if scene.get("wrist") is not None:
+            scene["wrist"].close()
+        print("\n===== summary =====")
+        for r in results:
+            extra = r.get("why") or (f"grip {r.get('grip_mm')} mm" if r["status"] == "done" else "")
+            if r.get("forced"):
+                extra += "  [forced: collision with a block was expected]"
+            print(f"  cell {r['cell']}: {r['status']:8s} {extra}")
+        return results
+    except KeyboardInterrupt:                              # Ctrl-C: arm back to rest, then stop
+        safe_rest(p, args)
+        raise SystemExit("stopped by Ctrl+C")
 
 
 if __name__ == "__main__":
