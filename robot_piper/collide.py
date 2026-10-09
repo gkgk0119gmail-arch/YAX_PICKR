@@ -14,7 +14,10 @@ import arm_ik
 
 ROOT = Path(__file__).resolve().parents[1]
 MARGIN = 0.008                                       # (real grasps worked with ~1 cm between blocks)
-BLOCK_HALF = 0.045                                   # 90 x 90 x 120 mm blocks (bubble wrap: +-)
+BLOCK_HALF = 0.045                                   # 90 x 90 x 120 mm blocks (bubble wrap: +-) when no size is known
+BLOCK_PAD = 0.006                                    # the top-face fit reads ~5-10 mm small on bubble wrap
+SQUARE_TOL_M = 0.015                                 # top sides differing less than this: a square top (fit noise
+                                                     # on square tops is <= 8 mm; a block lying on its side: 23-30 mm)
 WALL_HALF = 0.006                                    # basket wall / divider half thickness
 T_FLANGE_D405 = np.array(json.loads((ROOT / "pac2026" / "calib" / "wrist_cam_to_flange.json").read_text())["T_flange_cam"])
 
@@ -39,10 +42,30 @@ def gripper_points(tcp, opening):
     return np.vstack([body, *fingers, cam])
 
 
-def block_points(xy, yaw_deg, table_z, height):
+def is_square(size_m):
+    """Top face (short, long side, m) about square? Then either side is the short one."""
+    return size_m is None or size_m[1] - size_m[0] <= SQUARE_TOL_M
+
+
+def grip_step(size_m):
+    """Tool yaws that grip the block across its SHORT top side repeat every 180 deg; on a square top every 90."""
+    return 90.0 if is_square(size_m) else 180.0
+
+
+def block_half(size_m):
+    """Footprint half sizes (along the jaw = across the short side, along the long side). Square tops keep the
+    on-site 90 x 90 mm; a rectangular top (e.g. a block lying on its side) uses its measured sides, padded."""
+    if is_square(size_m):
+        return (BLOCK_HALF, BLOCK_HALF)
+    return (size_m[0] / 2 + BLOCK_PAD, size_m[1] / 2 + BLOCK_PAD)
+
+
+def block_points(xy, yaw_deg, table_z, height, half=None):
+    """yaw_deg: the jaw direction (across the short side), half: block_half() (default: 90 x 90 mm)."""
     a = np.radians(yaw_deg)
     R = np.array([[np.cos(a), -np.sin(a), 0], [np.sin(a), np.cos(a), 0], [0, 0, 1]])
-    p = _box_pts([0, 0, height / 2], [BLOCK_HALF, BLOCK_HALF, height / 2])
+    hx, hy = half or (BLOCK_HALF, BLOCK_HALF)
+    p = _box_pts([0, 0, height / 2], [hx, hy, height / 2])
     return (R @ p.T).T + [xy[0], xy[1], table_z]
 
 
@@ -69,7 +92,8 @@ def basket_walls(cells_xy, axis_deg, pitch):
 
 class Scene:
     def __init__(self, table_z, blocks, walls, rim_z):
-        """blocks: list of dict(xy, yaw, top) (upright 80x80 boxes from the table to top)."""
+        """blocks: list of dict(xy, yaw, top[, half]) (upright boxes from the table to top; yaw = jaw direction,
+        half = block_half(), default 90 x 90 mm)."""
         self.table_z, self.blocks, self.walls, self.rim_z = table_z, blocks, walls, rim_z
 
     def clearance(self, P, skip_block=None, table_tol=0.0, walls=True):
@@ -83,9 +107,10 @@ class Scene:
             if i == skip_block:
                 continue
             a = np.radians(b["yaw"])
+            hx, hy = b.get("half") or (BLOCK_HALF, BLOCK_HALF)
             d = P[:, :2] - b["xy"]
-            u = np.abs(d @ [np.cos(a), np.sin(a)]) - BLOCK_HALF
-            v = np.abs(d @ [-np.sin(a), np.cos(a)]) - BLOCK_HALF
+            u = np.abs(d @ [np.cos(a), np.sin(a)]) - hx
+            v = np.abs(d @ [-np.sin(a), np.cos(a)]) - hy
             h = P[:, 2] - b["top"]
             c = float(np.min(np.max(np.stack([u, v, h]), 0)))        # >0 outside the box (by the largest gap)
             if c < worst:

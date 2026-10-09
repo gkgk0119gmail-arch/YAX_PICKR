@@ -83,7 +83,9 @@ def enable(p):
 
 
 def go_rest(p, speed):
+    import runlog
     _, js, _ = ht.read(p)
+    runlog.event("go_rest", q_now=js, speed=speed)
     js[1] = (js[1] + 180) % 360 - 180
     cfg = yaml.safe_load((ROOT / "pac2026" / "config.yaml").read_text())["robot"]
     z = ht.path_min_tip_z(js, REST_Q, cfg["tcp_offset_m"])
@@ -91,7 +93,7 @@ def go_rest(p, speed):
     z_now = (pos + R @ [0, 0, cfg["tcp_offset_m"] * 1000])[2]
     if z < min(z_now, 100) - 5:
         raise SystemExit(f"path to rest dips to tip z {z:.0f} mm (now {z_now:.0f}) - not moving")
-    ok, err, st = ht.move_j(p, REST_Q, speed)
+    ok, err, st = ht.move_j(p, REST_Q, speed, name="rest")
     print(f"rest {'reached' if ok else 'NOT reached'} (joint error {err:.2f} deg, {st.arm_status})")
     return ok
 

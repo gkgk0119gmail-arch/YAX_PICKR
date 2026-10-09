@@ -70,21 +70,40 @@ def path_min_tip_z(q_from, q_to, tcp, n=60):
     return float(min(zs))
 
 
-def move_j(p, q_deg, speed, tol_deg=0.5, timeout=40.0):
+def move_j(p, q_deg, speed, tol_deg=0.5, timeout=40.0, name=None):
     q = (np.asarray(q_deg) * 1000).round().astype(int)
     t0 = time.time()
     hist = []
-    while time.time() - t0 < timeout:
-        p.MotionCtrl_2(0x01, 0x01, speed, 0x00)                        # CAN control, MOVE J
-        p.JointCtrl(*[int(v) for v in q])
-        _, js, st = read(p)
-        js[1] = (js[1] + 180) % 360 - 180
-        err = float(np.abs(js - q_deg).max())
-        hist.append(js)
-        if err < tol_deg and len(hist) > 25 and np.ptp(np.array(hist[-25:]), 0).max() < 0.2:
-            return True, err, st
-        time.sleep(0.02)
-    return False, err, st
+    ok = False
+    try:
+        while time.time() - t0 < timeout:
+            p.MotionCtrl_2(0x01, 0x01, speed, 0x00)                    # CAN control, MOVE J
+            p.JointCtrl(*[int(v) for v in q])
+            _, js, st = read(p)
+            js[1] = (js[1] + 180) % 360 - 180
+            err = float(np.abs(js - q_deg).max())
+            hist.append(js)
+            if err < tol_deg and len(hist) > 25 and np.ptp(np.array(hist[-25:]), 0).max() < 0.2:
+                ok = True
+                return True, err, st
+            time.sleep(0.02)
+        return False, err, st
+    finally:                                                           # also on Ctrl-C: what the arm did
+        _log_move(name, q_deg, speed, hist, ok, time.time() - t0)
+
+
+def _log_move(name, q_deg, speed, hist, ok, secs):
+    import runlog
+    if runlog.folder() is None or not hist:
+        return
+    H = np.array(hist)
+    rest = np.array([0, 0, 0, 0, 25, 0], float)
+    d_rest = np.abs(H - rest).max(1)
+    i = int(np.argmin(d_rest))
+    runlog.event("move_j", name=name, speed=speed, ok=ok, secs=round(secs, 2), q_start=H[0], q_target=np.asarray(q_deg),
+                 q_end=H[-1], max_joint_change=np.ptp(H, 0), traj_10hz=H[::5],
+                 closest_to_rest_deg=round(float(d_rest[i]), 1), closest_to_rest_q=H[i],
+                 through_rest=bool(d_rest[i] < 15 and d_rest[0] >= 15 and np.abs(np.asarray(q_deg) - rest).max() >= 15))
 
 
 def read(p):

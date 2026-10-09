@@ -54,8 +54,10 @@ def main():
     r = tgt["robot"]
     top = np.array(r["top_xyz_m"])
     others = [np.array(b["robot"]["top_xyz_m"]) for b in blocks if b is not tgt]
-    yaw = yaw_for_jaw(r["jaw_yaw_deg"])
-    yaws = sorted({(yaw + k * 90) % 360 for k in range(4) if 60 <= (yaw + k * 90) % 360 <= 300},
+    import collide
+    step = collide.grip_step(r.get("size_m"))           # rectangular top: only across the short side
+    yaw = yaw_for_jaw(r["jaw_yaw_deg"], step)
+    yaws = sorted({(yaw + k * step) % 360 for k in range(int(360 // step)) if 60 <= (yaw + k * step) % 360 <= 300},
                   key=lambda y: abs(y - 180))
     best = None
     for y in yaws:

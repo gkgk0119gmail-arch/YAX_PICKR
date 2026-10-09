@@ -10,6 +10,7 @@ The arm must start at the rest pose (it would hide the blocks). Ends at rest, en
 import argparse
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,11 +33,12 @@ TIP_TO_BLOCK_BOTTOM = GRASP_ABOVE_TABLE
 BLOCK_HALF_DIAG = 0.06
 
 
-def yaw_for_jaw(jaw_deg):
-    """Tool yaw whose jaws close along jaw_deg (tool y = (sin yaw, -cos yaw)); cube: 90 deg symmetric,
-    pick the one closest to 180 (wrist mid-range)."""
+def yaw_for_jaw(jaw_deg, step=90.0):
+    """Tool yaw whose jaws close along jaw_deg (tool y = (sin yaw, -cos yaw)), the one closest to 180 (wrist
+    mid-range). step: collide.grip_step(size) - 180 for a rectangular top (only across the short side),
+    90 for a square top."""
     base = jaw_deg + 90.0
-    cands = [base + k * 90.0 for k in range(-4, 5)]
+    cands = [base + k * step for k in range(-4, 5)]
     return min(cands, key=lambda y: abs(((y - 180) + 180) % 360 - 180)) % 360
 
 
@@ -73,23 +75,58 @@ def path_ok(q_a, q_b, tcp, table_z, others, carrying, top_z, n=40, end_relax=Fal
 
 class WristSeen:
     """D405 (wrist) view: a held block sits ~6-10 cm in front of it (calibrated mount), the table is
-    further. holding() = most of the centre of the view is closer than NEAR_M."""
+    further. holding() = most of the centre of the view is closer than NEAR_M.
+    One background thread reads the camera (newest colour for the live view; depth frames on request), so
+    the checks and the live picture never fight over the frames."""
     NEAR_M = 0.12
 
     def __init__(self):
         from charuco_view import Cam
         self.cam = Cam("wrist")
+        self.cam.collect = self.collect                     # wrist_check.grab_wrist takes frames from here
         self.last = None
+        self._lock = threading.Lock()
+        self._color = None
+        self._req = None                                    # [n, aligned, frames list, Event]
+        self._run = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while self._run:
+            try:
+                fs = self.cam.pipe.wait_for_frames(1000)
+            except RuntimeError:
+                continue
+            req = self._req
+            if req is not None and len(req[2]) < req[0]:
+                f2 = self.cam.align.process(fs) if req[1] else fs
+                d, c = f2.get_depth_frame(), f2.get_color_frame()
+                if d:
+                    req[2].append((np.asanyarray(d.get_data()).astype(np.float32) * self.cam.scale,
+                                   np.asanyarray(c.get_data()).copy() if c else None))
+                    if len(req[2]) >= req[0]:
+                        req[3].set()
+            c = fs.get_color_frame()
+            if c:
+                with self._lock:
+                    self._color = np.asanyarray(c.get_data()).copy()
+
+    def latest(self):
+        with self._lock:
+            return None if self._color is None else self._color.copy()
+
+    def collect(self, n, aligned=True, timeout=4.0):
+        """The next n depth frames (m; aligned to colour if asked) and the last colour frame."""
+        req = [n, aligned, [], threading.Event()]
+        self._req = req
+        req[3].wait(timeout)
+        self._req = None
+        fr = list(req[2])
+        return [d for d, _ in fr], next((c for _, c in reversed(fr) if c is not None), self.latest())
 
     def holding(self, frames=8):
-        fr = []
-        t0 = time.time()
-        while len(fr) < frames and time.time() - t0 < 3:
-            fs = self.cam.pipe.poll_for_frames()
-            if fs:
-                d = np.asanyarray(fs.get_depth_frame().get_data()).astype(np.float32) * self.cam.scale
-                fr.append(d)
-            time.sleep(0.01)
+        fr, _ = self.collect(frames, aligned=False, timeout=3)
         if not fr:
             return None, None
         d = np.median(np.array(fr), 0)
@@ -101,6 +138,8 @@ class WristSeen:
         return near > 0.4, near
 
     def close(self):
+        self._run = False
+        self._thread.join(2)
         self.cam.pipe.stop()
 
 
@@ -109,7 +148,10 @@ def gripper(p, width_mm, effort, secs=1.2):
     while time.time() - t0 < secs:
         p.GripperCtrl(int(round(width_mm * 1000)), effort, 0x01, 0)
         time.sleep(0.02)
-    return p.GetArmGripperMsgs().gripper_state.grippers_angle / 1000.0
+    w = p.GetArmGripperMsgs().gripper_state.grippers_angle / 1000.0
+    import runlog
+    runlog.event("gripper", target_mm=width_mm, reached_mm=w, effort=effort)
+    return w
 
 
 def main():
@@ -156,11 +198,14 @@ def main():
     H = r["height_m"]
     others = [np.array(b["robot"]["top_xyz_m"]) for b in blocks if b is not tgt]
     pick_xy = np.array(r["top_xyz_m"][:2])
-    yaw_p = yaw_for_jaw(r["jaw_yaw_deg"])
+    import collide
+    step = collide.grip_step(r.get("size_m"))
+    yaw_p = yaw_for_jaw(r["jaw_yaw_deg"], step)
     z_grasp = table_z + GRASP_ABOVE_TABLE
     z_carry = table_z + H + 0.025          # tip 2.5 cm above the block tops; path checks catch crossings
-    yaws_p = sorted({(yaw_p + k * 90) % 360 for k in range(4)} & set(
-        y for y in ((yaw_p + k * 90) % 360 for k in range(4)) if 60 <= y <= 300), key=lambda y: abs(y - 180))
+    n_yaw = int(360 // step)
+    yaws_p = sorted({(yaw_p + k * step) % 360 for k in range(n_yaw)} & set(
+        y for y in ((yaw_p + k * step) % 360 for k in range(n_yaw)) if 60 <= y <= 300), key=lambda y: abs(y - 180))
 
     # ------------------------------------------------------------ plan
     rng = np.random.default_rng(args.seed)

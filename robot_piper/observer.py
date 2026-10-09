@@ -111,7 +111,7 @@ class Observer:
                     keep.append(o)
             self._res = dict(blocks=[o for o in keep if o["label"] == "block" and o.get("robot")],
                              containers=[o for o in keep if o["label"] == "container"],
-                             color=f.color, mask=mask, K=K, secs=time.time() - t0)
+                             color=f.color, depth=f.depth_m, mask=mask, K=K, q=q, secs=time.time() - t0)
         except Exception as e:                              # a failed check must not stop the arm
             self._res = dict(error=str(e), blocks=[], containers=[], secs=time.time() - t0)
 

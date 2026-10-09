@@ -5,6 +5,7 @@
   ./pickr.sh --cells 1 3        those cells (robot view: 1 far-left, 2 far-right, 3 near-left, 4 near-right)
   ./pickr.sh --dry-run          scan + plan + all safety checks, the arm does not move
   ./pickr.sh --yes              no confirmation prompt
+  ./pickr.sh --no-view          no live camera window (it opens by default; F = full screen, Q = close)
 
 The scene (basket, cells, blocks) is scanned ONCE at the start and remembered; cells are filled farthest from
 the robot first and every placed block becomes an obstacle for the next plans.
@@ -109,12 +110,32 @@ def main():
     ap.add_argument("--yes", action="store_true")
     ap.add_argument("--wait-hands", action="store_true", help="wait until no hand is in view before the scan")
     ap.add_argument("--collide", action="store_true", help="plan with 3D collision checks (off by default)")
+    ap.add_argument("--preview", action="store_true", help="scan only: picture with block (B1..) and cell (#1..) numbers")
+    ap.add_argument("--order", help='block->cell from the last preview, e.g. "B2:2,B1:1,B3:4"')
+    ap.add_argument("--no-view", action="store_true", help="no live camera window")
     args = ap.parse_args()
+    import runlog
+    runlog.start(sys.argv)                                # console + every move -> pac2026/runs/logs/pickr_<time>/
+    if not args.no_view:                                  # live window with both RealSense views (own process)
+        import live_view
+        live_view.start()
+        try:
+            subprocess.Popen([sys.executable, str(ROOT / "robot_piper" / "live_viewer.py")],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            print(f"[view] live window not started: {e}")
     # models (Grounding DINO, SAM2, VGGT) load on the GPU while the preflight runs and the prompt waits
     loaded = {}
 
     def load():
         try:
+            # quiet: progress bars ("\r") / warnings from this thread overwrote the "Press Enter" prompt, so the
+            # run looked frozen while it was waiting for Enter
+            import warnings
+            from transformers.utils import logging as hf_logging
+            hf_logging.set_verbosity_error()
+            hf_logging.disable_progress_bar()
+            warnings.filterwarnings("ignore", category=FutureWarning)
             import fill_cells
             loaded["finder"] = fill_cells.load_finder()
         except BaseException as e:                       # re-raised in the main thread
@@ -122,9 +143,9 @@ def main():
     loader = threading.Thread(target=load, daemon=True)
     loader.start()
     print("== PICKR preflight ==")
-    if not (check_can() and check_cameras() and check_arm(args.dry_run)):
+    if not (check_can() and check_cameras() and check_arm(args.dry_run or args.preview)):
         sys.exit("preflight failed - nothing was started")
-    if not args.dry_run and not args.yes:
+    if not args.dry_run and not args.yes and not args.preview:
         print(f"\nThe arm will move (speed {args.speed}%). Cells: {' '.join(args.cells)}. "
               "Keep hands out of the table area; e-stop in reach.")
         if input("Press Enter to start, anything else to cancel: ").strip():
@@ -137,15 +158,21 @@ def main():
     import fill_cells
     argv = ["--cells", *args.cells, "--max", str(args.max), "--speed", str(args.speed),
             "--line-speed", str(args.line_speed)]
-    if not args.dry_run:
+    if not args.dry_run and not args.preview:
         argv.append("--go")
     if args.wait_hands:
         argv.append("--wait-hands")
     if args.collide:
         argv.append("--collide")
+    if args.preview:
+        argv.append("--preview")
+    if args.order:
+        argv += ["--order", args.order]
     results = fill_cells.main(argv, loaded["finder"])
     ok = sum(r["status"] in ("done", "planned") for r in results)
     print(f"\n{ok}/{len(results)} cell rounds {'planned' if args.dry_run else 'done'}; pictures in pac2026/runs/")
+    runlog.event("end", results=results)
+    print(f"debug log: {runlog.folder()}")
 
 
 if __name__ == "__main__":

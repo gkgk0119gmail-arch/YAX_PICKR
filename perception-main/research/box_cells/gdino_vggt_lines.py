@@ -224,9 +224,14 @@ def equal_cells(corners, rows, cols):
     return cells
 
 
-def cells_to_robot(quads, depth_m, K, roi_c, wall_h=None):
+def cells_to_robot(quads, depth_m, K, roi_c, wall_h=None, line_h=None):
     """Cell centres in the robot base frame from RealSense depth (aligned to colour) + the top-camera
-    calibration. Returns per cell: floor centre xyz (m), and the box rim height (m) for the whole box."""
+    calibration. Returns per cell: floor centre xyz (m), and the box rim height (m) for the whole box.
+
+    The cell outlines are the inner wall faces found in a height slice (about half the wall height), not
+    the floor. So each outline corner is a camera ray that is intersected with the plane at that height
+    (line_h above the cell floor) - a corner pushed to floor depth instead would move every centre
+    ~1 cm away from the camera (checked against a top-down height map of the walls: 1-2 mm vs 9-11 mm)."""
     T = np.array(json.loads(CALIB_TOP.read_text())["T_base_cam"])
     H, W = depth_m.shape
     vv, uu = np.mgrid[0:H, 0:W]
@@ -268,10 +273,18 @@ def cells_to_robot(quads, depth_m, K, roi_c, wall_h=None):
             out.append(None)
             continue
         floor_z = float(np.median(P[:, 2]))
-        c = np.asarray(q, float).mean(0)
-        zc = float(np.median(d[core][d[core] > 0.1]))
-        pc = np.array([(c[0] - K["cx"]) / K["fx"] * zc, (c[1] - K["cy"]) / K["fy"] * zc, zc])
-        xyz = T[:3, :3] @ pc + T[:3, 3]
+        if line_h is not None:                           # photogrammetry: corner rays meet the line plane
+            o = T[:3, 3]
+            hits = []
+            for u, v in np.asarray(q, float):
+                dw = T[:3, :3] @ np.array([(u - K["cx"]) / K["fx"], (v - K["cy"]) / K["fy"], 1.0])
+                hits.append(o + (floor_z + line_h - o[2]) / dw[2] * dw)
+            xyz = np.mean(hits, 0)
+        else:
+            c = np.asarray(q, float).mean(0)
+            zc = float(np.median(d[core][d[core] > 0.1]))
+            pc = np.array([(c[0] - K["cx"]) / K["fx"] * zc, (c[1] - K["cy"]) / K["fy"] * zc, zc])
+            xyz = T[:3, :3] @ pc + T[:3, 3]
         xyz[2] = floor_z
         out.append(dict(floor_xyz_m=xyz.round(4).tolist(), reach_m=round(float(np.hypot(xyz[0], xyz[1])), 3)))
     return out, rim_z
@@ -424,7 +437,8 @@ def scan(image=None, prompts=None, no_crop=False, slice_frac=None, margin=0.25, 
         # rim = table next to the basket + wall height (known, else measured on the outer walls in this scan;
         # RealSense depth on the thin wall tops alone reads ~2-3 cm too low)
         rc, rim_z = cells_to_robot([c["quad_px"] for c in cells], rs_depth, K, roi_c,
-                                   wall_h=spec["wall_height_m"] if spec else float(res["box_height"]))
+                                   wall_h=spec["wall_height_m"] if spec else float(res["box_height"]),
+                                   line_h=float(np.mean(args.slice or bl.SLICE)) * float(res["box_height"]))
         robot = {"rim_z_m": round(rim_z, 4), "cells": []}
         print(f"robot frame (top_cam_to_base): box rim at z {rim_z * 1000:.0f} mm")
         for c, r in zip(cells, rc):
