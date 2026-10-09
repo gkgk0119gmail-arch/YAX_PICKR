@@ -56,7 +56,11 @@ class Pipeline:
         return part
 
     def z_safe(self, box):
-        return self.table_z + box.height_m + self.block_h + self.cfg["motion"]["safe_margin_m"]
+        """Tip height for moving over the box: the held block's bottom clears the rim by safe_margin_m.
+        (Was rim + block + margin, i.e. the tip a whole block higher than needed — the PiPER with its
+        0.135 m gripper needs ~20° of tool tilt at 0.17 m already, MuJoCo twin.)"""
+        m = self.cfg["motion"]
+        return self.table_z + box.height_m + (self.block_h - m["grasp_depth_m"]) + m["safe_margin_m"]
 
     def step3_pick(self, g, box):
         self._step(3, "running", f"블록 ({g.center_px[0]:.0f},{g.center_px[1]:.0f}) 점수 {g.score:.2f}")
@@ -72,6 +76,7 @@ class Pipeline:
             r.over_block = max(15.0, g.opening_px * 0.6)
         r.close()
         r.move_to(x, y, z_grasp + m["lift_m"], yaw)
+        self.last_pick = (x, y, yaw)
         self._step(3, "ok", f"x={x:.3f} y={y:.3f} m yaw={np.degrees(yaw):.0f}°")
         return self.step4_holding()
 
@@ -79,6 +84,7 @@ class Pipeline:
         self._step(4, "running", "그리퍼 폭")
         w = self.robot.gripper_width_mm()
         ok = w > self.cfg["robot"]["holding_min_mm"]
+        self.held_mm = w                                              # release opens just a bit wider than this
         # TODO: + wrist D405 check (depth pixels between the fingers) once mounted
         self.log.metric(gripper_mm=round(w, 1))
         self.log.info(f"4. holding? gripper width {w:.0f} mm -> {'yes' if ok else 'NO'}")
@@ -92,7 +98,9 @@ class Pipeline:
         self._step(5, "running", f"칸 {cell.id}")
         x, y = self.calib.to_robot(*cell.center_px)
         yaw = self.calib.yaw_to_robot(*cell.center_px, cell.yaw_deg)
-        self.robot.move_to(x, y, self.z_safe(box), yaw)
+        px, py, pyaw = self.last_pick
+        self.robot.move_to(px, py, self.z_safe(box), pyaw)        # straight up first: a diagonal from the
+        self.robot.move_to(x, y, self.z_safe(box), yaw)           # lift height drags the block over the rim
         self._step(5, "ok", f"칸 {cell.id} 위 z={self.z_safe(box):.3f} m")
         return x, y, yaw
 
@@ -110,10 +118,14 @@ class Pipeline:
         self._step(7, "running", f"칸 {cell.id}에 내려놓기")
         m = self.cfg["motion"]
         x, y, yaw = xy_yaw
-        floor = self.table_z + 0.005                                  # cell floor ~ table + cardboard
+        floor = self.table_z + m["cell_floor_m"]
         z_release = floor + m["release_above_floor_m"] + self.block_h - m["grasp_depth_m"]
+        # only the finger pads may go into the cell: the housing above them would hit the dividers
+        z_release = max(z_release, self.table_z + box.height_m + m["housing_clear_m"] - self.cfg["robot"]["finger_len_m"])
         self.robot.move_to(x, y, z_release, yaw)
-        self.robot.open()
+        # open only a little past the block: fully open (70 mm) the fingers hit the dividers (MuJoCo twin)
+        held = getattr(self, "held_mm", None) or self.cfg["robot"]["gripper_open_mm"]
+        self.robot.open(min(held + m["release_extra_mm"], self.cfg["robot"]["gripper_open_mm"]))
         if hasattr(self.robot, "over_block"):
             self.robot.over_block = None
         self.robot.move_to(x, y, self.z_safe(box), yaw)

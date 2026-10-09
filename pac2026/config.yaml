@@ -29,6 +29,7 @@ robot:
   down_rpy_deg: [180.0, 0.0, 0.0]   # flange orientation for a top-down grasp (ON SITE)
   gripper_open_mm: 70
   gripper_effort: 1000          # 0..5000 = 0..5 N·m
+  finger_len_m: 0.06            # finger pad length; the housing starts above it (AgileX URDF)
   holding_min_mm: 10            # closed width above this = something between the fingers
   mock_fail_rate: 0.0           # mock only: chance that a grasp misses (to exercise retries)
   sim_host: localhost           # sim only: sim_tools/twin_server.py (may run on another PC)
@@ -40,10 +41,13 @@ calibration:
 
 motion:
   block_height_m: 0.04
-  safe_margin_m: 0.05           # extra clearance above the box rim while moving
+  safe_margin_m: 0.02           # held block's bottom this far above the box rim while moving
   lift_m: 0.05                  # lift after closing the gripper, then check the grasp
   grasp_depth_m: 0.015          # finger tips this far below the block top
   release_above_floor_m: 0.01   # block bottom this far above the cell floor when released
+  housing_clear_m: 0.01         # release: gripper housing this far above the rim (pads only in the cell)
+  release_extra_mm: 10          # release: open to (held width + this), not fully - fingers hit the dividers
+  cell_floor_m: 0.008           # cell floor above the table (RealSense +0.8 cm, docs/update_2026-10-07.md)
 
 retry:
   pick: 3
