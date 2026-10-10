@@ -161,7 +161,7 @@ def draw(color, K, box, wall, pl, stop_at):
     return img
 
 
-def main():
+def parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--side", choices=list(SIDES), default="right")
     ap.add_argument("--distance", type=float, default=0.30)
@@ -175,15 +175,20 @@ def main():
     ap.add_argument("--drag-speed", type=int, default=80, help="controller speed %% while pulling")
     ap.add_argument("--effort", type=int, default=5000)
     ap.add_argument("--image", type=Path, help="offline: folder with color.jpg + intrinsics.json")
-    args = ap.parse_args()
+    return ap
+
+
+def main(argv=None, p=None, grab=None):
+    """p given (demo.py): preflight and the debug log are the caller's; only scan, plan and the pull here.
+    grab: () -> (colour, depth, K) from cameras the caller keeps open (live view); default: open, take, close."""
+    args = parser().parse_args(argv)
     tcp = yaml.safe_load((ROOT / "pac2026" / "config.yaml").read_text())["robot"]["tcp_offset_m"]
     out = ROOT / "pac2026" / "runs" / f"drag_{time.strftime('%Y%m%d_%H%M%S')}"
     out.mkdir(parents=True, exist_ok=True)
-    p = None
-    if not args.image:
+    if not args.image and p is None:
         import runlog
         runlog.start(sys.argv)
-    if not args.dry_run and not args.image:
+    if not args.dry_run and not args.image and p is None:
         import pickr
         if not (pickr.check_can() and pickr.check_cameras() and pickr.check_arm(False)):
             sys.exit("preflight failed - nothing was started")
@@ -194,7 +199,7 @@ def main():
         K = json.loads((args.image / "intrinsics.json").read_text())
     else:
         import move_partition
-        color, _, K = move_partition.capture()
+        color, _, K = (grab or move_partition.capture)()
     cv2.imwrite(str(out / "color.jpg"), color)
     (out / "intrinsics.json").write_text(json.dumps(K))
     P, s = ps.vggt_points(color, K)

@@ -379,7 +379,7 @@ def capture():
     return f.color, f.depth_m, f.intrinsics
 
 
-def main(argv=None):
+def parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dry-run", action="store_true", help="scan + plan only, the arm does not move")
     ap.add_argument("--yes", action="store_true")
@@ -396,7 +396,11 @@ def main(argv=None):
     ap.add_argument("--image", type=Path, help="offline: folder with color.jpg, rs_depth_m.npy, intrinsics.json")
     ap.add_argument("--no-view", action="store_true")
     ap.add_argument("--no-qwen", action="store_true", help="skip the Qwen3-VL cross-check of box / partition")
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
     side = 1.0 if args.box_side == "left" else -1.0
     cfg = yaml.safe_load((ROOT / "pac2026" / "config.yaml").read_text())["robot"]
     tcp = cfg["tcp_offset_m"]

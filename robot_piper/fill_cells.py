@@ -442,7 +442,7 @@ def update_scene_from_obs(scene, res, carried=None, blocks=True, basket=True):
         for di, d in enumerate(clear):
             if di in used_d or d["robot"]["top_xyz_m"][2] - d["robot"].get("table_z_m", 0.0) < 0.06:
                 continue
-            if any(np.hypot(*(xy_of(d) - xy_of(b))) < 0.10 for b in scene["free"]):
+            if any(np.hypot(*(xy_of(d) - xy_of(b))) < 0.10 for b in scene["free"]) or is_defect(scene, d):
                 continue
             d["order_rank"] = max([b.get("order_rank", 0) for b in scene["free"]] + [0]) + 1
             scene["free"].append(d)
@@ -516,6 +516,11 @@ class Skip(Exception):
 
 class PickSkip(Skip):
     """The BLOCK cannot be picked (wrist cannot reach it as measured) - no other cell will change that."""
+
+
+class CellSkip(Skip):
+    """The CELL cannot be reached with any tilt although the block could be picked with every one of them - no
+    other block (nor a rescan) will change that: the cell is given up at once instead of trying every block."""
 
 
 class Halt(Exception):
@@ -630,6 +635,74 @@ def scan_scene(finder, tag="scene"):
               basket_ref_xy=basket_xy_from(objs, rim_z, K))
     live_view.scene(sc)                                     # dashboard: cells, blocks, progress (read live)
     return sc
+
+
+DEFECT_TOL = 0.30            # --bul: a block whose a, b or h is this far (relative) from the mean of all blocks
+DEFECT_NEAR_M = 0.06          # a detection this close to a known defective block is that block (rescans)
+
+
+def find_defects(scene):
+    """--bul: the a (long side), b (short side), h (height) of every block on the table as one matrix; a block
+    whose value in any column is more than DEFECT_TOL away from that column's mean (over the good blocks) is defective. Defective
+    blocks leave scene["free"] (no order, no cell) and stay obstacles; a red X marks them in the pictures."""
+    # h: the RealSense height (height_rs_m) - used for this check only; everything else keeps height_m
+    hgt = lambda r: r.get("height_rs_m", r.get("height_m"))
+    blocks = [b for b in scene["free"] if b["robot"].get("size_m") and hgt(b["robot"])]
+    if len(blocks) < 2:
+        print("[bul] fewer than 2 measured blocks - no defect check")
+        return []
+    M = np.array([[max(b["robot"]["size_m"]), min(b["robot"]["size_m"]), hgt(b["robot"])] for b in blocks])
+    # the mean of the GOOD blocks: one wild value (a bad detection, a crushed block) must not drag the mean
+    # until good blocks fail - start from the median, drop what is >30% off, take the mean again until stable
+    mean = np.median(M, 0)
+    for _ in range(10):
+        ok = (np.abs(M - mean) / np.abs(mean) <= DEFECT_TOL).all(1)
+        new = M[ok].mean(0) if ok.any() else mean
+        if np.allclose(new, mean):
+            break
+        mean = new
+    rel = np.abs(M - mean) / np.abs(mean)
+    bad = rel > DEFECT_TOL
+    print(f"[bul] block sizes (mm, h = RealSense), defective = any of a / b / h more than {DEFECT_TOL * 100:.0f}% from the mean")
+    print("        block (x, y)        a      b      h      da     db     dh")
+    for b, m, r, f in zip(blocks, M * 1000, (M - mean) / np.abs(mean) * 100, bad):
+        t = np.array(b["robot"]["top_xyz_m"][:2]) * 1000
+        print(f"   ({t[0]:4.0f}, {t[1]:4.0f})  {m[0]:6.0f} {m[1]:6.0f} {m[2]:6.0f}  "
+              + "  ".join(f"{v:+4.0f}%{'!' if x else ' '}" for v, x in zip(r, f))
+              + ("   DEFECTIVE" if f.any() else ""))
+    print(f"   mean (good)   {mean[0] * 1000:6.0f} {mean[1] * 1000:6.0f} {mean[2] * 1000:6.0f}")
+    defects = [b for b, f in zip(blocks, bad) if f.any()]
+    signed = (M - mean) / np.abs(mean)                       # + bigger / - smaller than the good blocks
+    for b, r, f in zip(blocks, signed, bad):
+        if f.any():
+            b["defect"] = ", ".join(f"{n} {v * 100:+.0f}%" for n, v, x in zip("abh", r, f) if x)
+    scene["defects"] = scene.get("defects", []) + defects
+    scene["free"] = [b for b in scene["free"] if not any(b is d for d in defects)]
+    runlog.event("defects", matrix_mm=(M * 1000).round(1).tolist(), mean_mm=(mean * 1000).round(1).tolist(),
+                 defects=[d["robot"]["top_xyz_m"] for d in defects], why=[d["defect"] for d in defects])
+    try:
+        from observer import project
+        img = cv2.imread(str(scene["run"] / "color.jpg"))
+        for b in blocks:
+            u, v = project(np.array(b["robot"]["top_xyz_m"])[None], scene["K"])[0].astype(int)
+            if any(b is d for d in defects):
+                cv2.line(img, (u - 40, v - 40), (u + 40, v + 40), (0, 0, 255), 8)
+                cv2.line(img, (u - 40, v + 40), (u + 40, v - 40), (0, 0, 255), 8)
+                cv2.putText(img, b["defect"], (u - 60, v + 70), 0, 0.7, (0, 0, 255), 2)
+            else:
+                cv2.circle(img, (u, v), 26, (0, 200, 0), 3)
+        cv2.imwrite(str(scene["run"] / "defects.png"), img)
+        print(f"[bul] {len(defects)} defective block(s) excluded -> {scene['run'] / 'defects.png'}")
+    except Exception as e:                                   # noqa: BLE001 - the picture is only for people
+        print(f"[bul] {len(defects)} defective block(s) excluded (no picture: {e})")
+    return defects
+
+
+def is_defect(scene, b):
+    """A detection at the place of a known defective block (they are never moved)."""
+    xy = np.array(b["robot"]["top_xyz_m"][:2])
+    return any(np.hypot(*(xy - np.array(d["robot"]["top_xyz_m"][:2]))) < DEFECT_NEAR_M
+               for d in scene.get("defects", []))
 
 
 def cell_halves(scene, k):
@@ -925,7 +998,8 @@ def rescan_blocks(scene, finder):
         c = scene["num"][k]["robot"]["floor_xyz_m"]
         scene["placed"].append(dict(xy=np.array(c[:2]), yaw=scene["axis"], top=c[2] + BLOCK_H_MIN))
     scene["occupied"] |= filled
-    scene["free"] = [b for b in blocks if not inside(scene["poly"], b["robot"]["top_xyz_m"][:2])]
+    scene["free"] = [b for b in blocks if not inside(scene["poly"], b["robot"]["top_xyz_m"][:2])
+                     and not is_defect(scene, b)]               # --bul: defective blocks stay out
     scene["run"], scene["K"] = run, K
     print(f"[rescan] Qwen {finder.last_prior}; {len(scene['free'])} block(s) on the table, cells filled "
           f"{sorted(scene['occupied'])}")
@@ -968,7 +1042,7 @@ def run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, only_block=N
                                      scene["pitch"])
         obst = [dict(xy=np.array(b["robot"]["top_xyz_m"][:2]), yaw=b["robot"]["jaw_yaw_deg"],
                      top=max(b["robot"]["top_xyz_m"][2], b["robot"]["table_z_m"] + block_height(b["robot"])),
-                     half=collide.block_half(b["robot"].get("size_m"))) for b in scene["free"]]
+                     half=collide.block_half(b["robot"].get("size_m"))) for b in scene["free"] + scene.get("defects", [])]
         obst += scene["placed"]
         scene_c = collide.Scene(float(tgt["robot"]["table_z_m"]), obst, walls, scene["rim_z"])
         try:
@@ -996,8 +1070,9 @@ def run_cell(cell_no, scene, p, finder, args, tcp, effort, open_mm, only_block=N
                                         top=cell_floor + block_height(tgt["robot"])))
             scene["occupied"].add(placed_cell)
         return dict(cell=placed_cell, run=str(run), **res)
-    raise (PickSkip if isinstance(last_err, PickSkip) and only_block is not None else Skip)(
-        f"no block could be planned ({last_err})")
+    kind = (CellSkip if isinstance(last_err, CellSkip)
+            else PickSkip if isinstance(last_err, PickSkip) and only_block is not None else Skip)
+    raise kind(f"no block could be planned ({last_err})")
 
 
 BETAS = [0, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20, 24, -24, 28, -28, 32, -32]   # tool tilt about the jaw axis
@@ -1272,7 +1347,9 @@ def plan_and_move(tgt, scene_c, tgt_idx, cell_no, cell_xy, cell_floor, num, poly
                                      p, finder, K, scan_dir, run, args, tcp, effort, open_mm, start_q, scene)
             finally:
                 _D405_RELAX[0] = False
-        raise (PickSkip if not pick_ok else Skip)(f"no tilt up to 32 deg works for this block ({np.hypot(*pick_xy) * 1000:.0f} mm from the "
+        kind = PickSkip if not pick_ok else CellSkip if (set(pick_ok) >= set(BETAS) and not place_ok
+                                                          and not reasons) else Skip
+        raise kind(f"no tilt up to 32 deg works for this block ({np.hypot(*pick_xy) * 1000:.0f} mm from the "
                    f"base): {why}")
     is_forced = "bad" in plan
     L, PL, beta = plan["L"], plan["PL"], plan["beta"]
@@ -1612,6 +1689,8 @@ def main(argv=None, finder=None):
     ap.add_argument("--collide", action="store_true", help="3D collision checks while planning (off by default)")
     ap.add_argument("--cell-look", action="store_true", help="D405 look at each empty cell before fetching a block")
     ap.add_argument("--preview", action="store_true", help="scan only: picture with block / cell numbers")
+    ap.add_argument("--bul", action="store_true",
+                    help="defect check: a block whose a / b / h is >30%% off the mean of all blocks is not used")
     ap.add_argument("--order", help='block->cell pairs from the last preview, e.g. "B2:2,B1:1,B3:4"')
     args = ap.parse_args(argv)
     import collide
@@ -1631,6 +1710,9 @@ def main(argv=None, finder=None):
         except (Halt, SystemExit) as e:
             print(f"[scene] {e}")
             return [dict(cell="-", status="HALT", why=str(e))]
+        if args.bul:                                            # defective blocks out before any order / cell
+            find_defects(scene)
+            live_view.scene(scene)
         preview_file = ROOT / "pac2026" / "runs" / "preview_latest.json"
         if args.preview:
             img = draw_preview(scene)
@@ -1728,10 +1810,11 @@ def main(argv=None, finder=None):
             go_rest(p, args.speed)
             scene["q_now"] = REST_Q.copy()
 
+        unreachable = set()                                 # cells no tilt reaches (CellSkip): never retried
         for attempt in range(RESCANS + 1):                  # leftover empty cells: scan again (Qwen) and refill
             rounds = 0
             fails = {}                                          # id(block) -> failed tries (tried again later)
-            dead_cells = set()                                  # cells no block could go into
+            dead_cells = set(unreachable)                       # cells no block could go into
             while pairs is None and want and rounds < args.max:     # team rule: cells in their fixed order, each
                 rounds += 1                                         # gets the next block in the block order
                 empty = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in dead_cells]
@@ -1760,6 +1843,10 @@ def main(argv=None, finder=None):
                         results.append(r)
                         done_round = True
                         break
+                    except CellSkip as e:                           # the cell itself is out of reach: no block helps
+                        unreachable.add(cell)
+                        print(f"   cell {cell} cannot be reached with any tilt ({e}) - given up, no other block tried")
+                        break
                     except Skip as e:                               # this block: the next one goes into this cell
                         fails[id(blk)] = fails.get(id(blk), 0) + 1
                         print(f"   block {blk.get('order_rank')} not done ({e}) - the next block goes into cell {cell}"
@@ -1778,7 +1865,9 @@ def main(argv=None, finder=None):
                     print(f"[order] no block could go into cell {cell} - it stays empty, next cell")
                     results.append(dict(cell=cell, status="skipped", why="no block could be placed in it"))
             halted = any(r["status"] == "HALT" for r in results)
-            empty_left = [k for k in want if k in scene["num"] and k not in scene["occupied"]]
+            empty_left = [k for k in want if k in scene["num"] and k not in scene["occupied"] and k not in unreachable]
+            if unreachable:
+                print(f"[order] cells {sorted(unreachable)} stay empty: no tilt reaches them (not retried)")
             if pairs is not None or halted or not args.go or not empty_left or attempt == RESCANS:
                 break
             print(f"\n[rescan {attempt + 1}/{RESCANS}] cells {empty_left} are still empty - back to rest, scan again "

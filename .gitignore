@@ -26,3 +26,6 @@ perception-main/ai_failure/data/
 # secrets
 .env
 *token*
+
+# offline speech model (voice_hello.py)
+models/vosk-*/

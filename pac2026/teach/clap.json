@@ -1,0 +1,48 @@
+{
+ "name": "clap",
+ "recorded": "hand-written 2026-10-10 (gripper clap, fixed beat, 70% height)",
+ "steps": [
+  {
+   "type": "waypoint",
+   "q": [
+    0,
+    10,
+    -35,
+    0,
+    25,
+    0
+   ],
+   "grip_mm": 2
+  },
+  {
+   "type": "waypoint",
+   "q": [
+    0,
+    20,
+    -28,
+    0,
+    -18,
+    0
+   ],
+   "grip_mm": 2
+  },
+  {
+   "type": "clap",
+   "times": 6,
+   "open_mm": 55,
+   "period": 0.4
+  },
+  {
+   "type": "waypoint",
+   "q": [
+    0,
+    20,
+    -28,
+    0,
+    -18,
+    0
+   ],
+   "grip_mm": 2
+  }
+ ]
+}

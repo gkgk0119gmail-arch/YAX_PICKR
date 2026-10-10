@@ -7,7 +7,7 @@
         the gripper is opened / closed BY HAND too; every waypoint keeps its opening
         q  save and finish (at the rest pose it also leaves teach mode - that resets the arm, power drops briefly)
   ./teach.sh play NAME [--vel 20] [--dry-run]
-        preflight (CAN, cameras, teach mode off, rest pose), asks once, then: rest -> waypoints -> rest.
+        preflight (CAN, cameras, teach mode off, rest pose), then at once (--ask: wait for Enter): rest -> waypoints -> rest.
         Each leg is a minimum-jerk joint interpolation (smooth start / stop) streamed at 50 Hz, then the arm
         settles exactly on the waypoint; then the gripper: taught wider than now -> opens fully, narrower ->
         closes with full force (stops on the plate). Extra g / o steps run where they were recorded.
@@ -77,6 +77,17 @@ def gripper_cmd(p, mm, effort, secs=3.0):
         p.GripperCtrl(int(round(mm * 1000)), effort, 0x01, 0)
         time.sleep(0.02)
     return grip_mm(p)
+
+
+def clap(p, times, open_mm, period, effort):
+    """Open / close the gripper on a fixed beat (period s per clap), without waiting for it to arrive."""
+    for _ in range(times):
+        for mm in (open_mm, CLOSE_MM):
+            t_end = time.time() + period / 2
+            while time.time() < t_end:
+                p.GripperCtrl(int(round(mm * 1000)), effort, 0x01, 0)
+                time.sleep(0.02)
+    return gripper_cmd(p, CLOSE_MM, effort, secs=1.0)
 
 
 # ------------------------------------------------------------------ record
@@ -209,6 +220,33 @@ def leg(p, a, b, vel, track_speed, name):
     return b
 
 
+def run_steps(p, steps, vel, track_speed=50, effort=5000, back_to_rest=True):
+    """Replay taught steps on a connected, enabled arm, from wherever it is now. A leg that is not reached
+    raises SystemExit (the arm holds its pose)."""
+    q_now = joints(p)
+    for i, s in enumerate(steps, 1):
+        if s["type"] == "waypoint":
+            q_now = leg(p, q_now, s["q"], vel, track_speed, f"step {i}: waypoint")
+            w_rec, w_now = s.get("grip_mm"), grip_mm(p)  # gripper as it was taught here: wider -> open fully,
+            if w_rec is not None and abs(w_rec - w_now) > GRIP_TOL:   # narrower -> close with full force
+                act = "open" if w_rec > w_now else "close"
+                w = gripper_cmd(p, OPEN_MM if act == "open" else CLOSE_MM, effort)
+                print(f"   step {i}: gripper {act} (taught {w_rec:.0f} mm) -> {w:.0f} mm", flush=True)
+        elif s["type"] == "clap":
+            w = clap(p, s["times"], s["open_mm"], s["period"], effort)
+            print(f"   step {i}: clap x{s['times']} -> {w:.0f} mm", flush=True)
+        else:
+            w = gripper_cmd(p, CLOSE_MM if s["action"] == "close" else OPEN_MM, effort)
+            print(f"   step {i}: gripper {s['action']} -> {w:.0f} mm", flush=True)
+    if back_to_rest:
+        leg(p, q_now, REST_Q, vel, track_speed, "back to rest")
+
+
+def replay(p, name, vel=20.0, **kw):
+    """Replay pac2026/teach/NAME.json on an already connected arm (used by demo.py, no preflight / prompt)."""
+    run_steps(p, json.loads((DIR / f"{name}.json").read_text())["steps"], vel, **kw)
+
+
 def play(name, args):
     data = json.loads((DIR / f"{name}.json").read_text())
     steps = data["steps"]
@@ -226,33 +264,22 @@ def play(name, args):
     if args.dry_run:
         for i, s in enumerate(steps, 1):
             print(f"   {i:2d}. " + (f"waypoint {np.round(s['q'], 1).tolist()}  gripper {s.get('grip_mm', 0):.0f} mm"
-                                    if s["type"] == "waypoint" else f"gripper {s['action']}"))
+                                    if s["type"] == "waypoint" else
+                                    f"clap x{s['times']} ({s['open_mm']:.0f} mm, {s['period']:.2f} s)"
+                                    if s["type"] == "clap" else f"gripper {s['action']}"))
         return
     import pickr
     if not (pickr.check_can() and pickr.check_cameras() and pickr.check_arm(False)):
         sys.exit("preflight failed - nothing was started")
-    if not args.yes and input("Press Enter to replay, anything else to cancel: ").strip():
+    if args.ask and input("Press Enter to replay, anything else to cancel: ").strip():
         sys.exit("cancelled")
     import runlog
     runlog.start(sys.argv)
     from board_hover import enable
     p = connect()
     enable(p)
-    q_now = joints(p)
     try:
-        for i, s in enumerate(steps, 1):
-            if s["type"] == "waypoint":
-                q_now = leg(p, q_now, s["q"], args.vel, args.track_speed, f"step {i}: waypoint")
-                w_rec, w_now = s.get("grip_mm"), grip_mm(p)  # gripper as it was taught here: wider -> open fully,
-                if w_rec is not None and abs(w_rec - w_now) > GRIP_TOL:   # narrower -> close with full force
-                    act = "open" if w_rec > w_now else "close"
-                    w = gripper_cmd(p, OPEN_MM if act == "open" else CLOSE_MM, args.effort)
-                    print(f"   step {i}: gripper {act} (taught {w_rec:.0f} mm) -> {w:.0f} mm", flush=True)
-            else:
-                w = gripper_cmd(p, CLOSE_MM if s["action"] == "close" else OPEN_MM, args.effort)
-                print(f"   step {i}: gripper {s['action']} -> {w:.0f} mm", flush=True)
-        if not args.no_return:
-            leg(p, q_now, REST_Q, args.vel, args.track_speed, "back to rest")
+        run_steps(p, steps, args.vel, args.track_speed, args.effort, not args.no_return)
     except KeyboardInterrupt:
         q = joints(p)
         for _ in range(20):                               # hold right here
@@ -270,7 +297,8 @@ def main():
     ap.add_argument("--track-speed", type=int, default=50, help="play: controller speed %% while streaming")
     ap.add_argument("--effort", type=int, default=5000, help="gripper effort 0..5000")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--yes", action="store_true")
+    ap.add_argument("--ask", action="store_true", help="play: wait for Enter after the preflight")
+    ap.add_argument("--yes", action="store_true", help="(default now; kept for old commands)")
     ap.add_argument("--no-return", action="store_true", help="play: stay at the last waypoint")
     args = ap.parse_args()
     if args.cmd == "list":

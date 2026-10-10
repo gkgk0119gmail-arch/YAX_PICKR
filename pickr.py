@@ -114,6 +114,8 @@ def main():
     ap.add_argument("--preview", action="store_true", help="scan only: picture with block (B1..) and cell (#1..) numbers")
     ap.add_argument("--order", help='block->cell from the last preview, e.g. "B2:2,B1:1,B3:4"')
     ap.add_argument("--no-view", action="store_true", help="no live camera window")
+    ap.add_argument("--bul", action="store_true",
+                    help="defect check: a block whose a / b / h is >30%% off the mean is marked (red X) and not used")
     args = ap.parse_args()
     import ik_pool
     ik_pool.start()                                       # planner IK workers: forked before any other thread
@@ -173,6 +175,8 @@ def main():
         argv.append("--preview")
     if args.order:
         argv += ["--order", args.order]
+    if args.bul:
+        argv.append("--bul")
     results = fill_cells.main(argv, loaded["finder"])
     ok = sum(r["status"] in ("done", "planned") for r in results)
     print(f"\n{ok}/{len(results)} cell rounds {'planned' if args.dry_run else 'done'}; pictures in pac2026/runs/")

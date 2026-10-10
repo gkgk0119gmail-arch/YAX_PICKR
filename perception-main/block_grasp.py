@@ -356,6 +356,7 @@ class BlockFinder:
             r = b["robot"]
             height = float(c[2] - tz_v)
             table_z = r["table_z_m"]                                # RealSense: absolute table height
+            r.setdefault("height_rs_m", r["height_m"])            # RealSense height, kept only for --bul defect check
             top_xyz = np.array([centre[0], centre[1], table_z + height])
             r.update(top_xyz_m=top_xyz.round(4).tolist(), height_m=round(height, 4),
                      grasp_xyz_m=[round(centre[0], 4), round(centre[1], 4), round(table_z + 0.5 * height, 4)],

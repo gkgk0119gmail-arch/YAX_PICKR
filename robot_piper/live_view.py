@@ -69,6 +69,11 @@ def set_source(name, fn, K=None):
         _state["K"] = K
 
 
+def stage(i, names=("Partition", "Blocks", "Drag")):
+    """Demo mode: which step runs (1-based; 0 = not started, len+1 = all done), drawn in the top bar."""
+    _state["stage"] = (int(i), tuple(names))
+
+
 def status(text):
     _state["status"] = str(text)
 
@@ -173,6 +178,15 @@ def _top_overlay(img):
             elif "box" in b:
                 x1, y1, x2, y2 = (int(round(v)) for v in b["box"])
                 cv2.rectangle(img, (x1, y1), (x2, y2), ORANGE[::-1], 4, cv2.LINE_AA)
+        if _state["K"] is not None:                          # --bul: defective blocks, red X
+            from observer import project
+            for b in sc.get("defects", []):
+                try:
+                    u, v = project(np.array(b["robot"]["top_xyz_m"], float)[None], _state["K"])[0].astype(int)
+                except Exception:
+                    continue
+                cv2.line(img, (u - 45, v - 45), (u + 45, v + 45), (0, 0, 255), 9, cv2.LINE_AA)
+                cv2.line(img, (u - 45, v + 45), (u + 45, v - 45), (0, 0, 255), 9, cv2.LINE_AA)
     if _state["targets"] and _state["K"] is not None:
         try:
             from observer import project
@@ -350,7 +364,22 @@ def render():
     d.ellipse((378, 38, 388, 48), fill=GREEN)
     st = re.sub(r"cell (\d+)", lambda m: f"cell {_state['cell_no'].get(int(m.group(1)), m.group(1))}",
                 _state["status"] or "ready")                # same numbers as on the picture
-    d.text((398, 43), st[:120], font=fm, fill=GREEN, anchor="lm")
+    stg = _state.get("stage")
+    d.text((398, 43), st[:62 if stg else 120], font=fm, fill=GREEN, anchor="lm")
+    if stg:                                             # demo: 1 Partition > 2 Blocks > 3 Drag, right-aligned
+        cur, names = stg
+        x = 1880
+        for k in range(len(names), 0, -1):
+            t = f"{k} {names[k - 1]}"
+            fb = _f(17, bold=True)
+            w = d.textlength(t, font=fb) + 20
+            col = GREEN if k < cur else BLUE if k == cur else LINE
+            d.rounded_rectangle((x - w, 29, x, 57), 6, fill=col)
+            d.text((x - w / 2, 43), t, font=fb, fill=(255, 255, 255) if k <= cur else MUTED, anchor="mm")
+            x -= w + 8
+            if k > 1:
+                d.text((x, 43), ">", font=fb, fill=MUTED, anchor="rm")
+                x -= 18
     _left(page, d)
     _wrist(page, d)
     _complete(d)

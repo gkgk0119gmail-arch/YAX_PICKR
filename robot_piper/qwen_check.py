@@ -19,10 +19,16 @@ PROMPT = ("Top-down photo of a table. Give the bounding box of (1) the open card
           '[{"label": "box" or "partition", "bbox_2d": [x1, y1, x2, y2]}].')
 
 
-def qwen_boxes(color):
+def qwen_boxes(color, finder=None):
+    """finder: its VGGT is parked on the CPU while Qwen is on the GPU (as qwen_blocks does)."""
     import torch
     from PIL import Image
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+    parked = None
+    if finder is not None and getattr(finder, "vggt", None) is not None:
+        parked = next(finder.vggt.parameters()).device
+        finder.vggt.to("cpu")
+        torch.cuda.empty_cache()
     model = Qwen3VLForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda").eval()
     proc = AutoProcessor.from_pretrained(MODEL)
     try:
@@ -37,6 +43,8 @@ def qwen_boxes(color):
         del model
         gc.collect()
         torch.cuda.empty_cache()
+        if parked is not None:
+            finder.vggt.to(parked)
     H, W = color.shape[:2]
     res = {"raw": txt}
     try:
