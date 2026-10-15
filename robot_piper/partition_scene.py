@@ -128,12 +128,17 @@ def touches_unseen(mask, seen, grow=3):
 
 
 def apply_size(rect, size, seen_mask):
-    """Known (long, short) size: keep the rectangle's near side (small x) and grow it away from the robot."""
+    """Known (long, short) size. Cut off by the image edge: keep the rectangle's near side (small x) and grow it
+    away from the robot; seen whole: keep the measured centre."""
     if size is None:
         return rect
     a, (L, W) = rect["axis"], size
-    near = rect["centre"] - a * rect["size"][0] / 2
-    r = dict(rect, centre=near + a * L / 2, size=(float(L), float(W)), sized=True)
+    if rect.get("cut"):
+        near = rect["centre"] - a * rect["size"][0] / 2
+        centre = near + a * L / 2
+    else:
+        centre = rect["centre"]
+    r = dict(rect, centre=centre, size=(float(L), float(W)), sized=True)
     r["corners"] = rect_corners(r["centre"], a, r["size"])
     return r
 

@@ -10,12 +10,14 @@
      at most fill_cells.RESCANS = 2 times) -> rest
   3  drag: grip the middle of the basket's right wall and pull it 30 cm to the right -> rest
   4  finale: the taught `clap` motion (pac2026/teach/clap.json) -> rest; if it fails the demo still counts as done
-  STOP in the live window at any time: the arm holds where it is and this process ends at once.
+  STOP in the live window at any time: the arm goes back to the rest pose (8 cm straight up first when it is low),
+  then this process ends; while it goes back the button reads HOLD: press it to stop the arm right there.
 A step that fails stops the demo there (the arm may not be at rest - it holds its pose).
 """
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -33,6 +35,7 @@ RESCANS = 1                    # demo: one recovery round for empty cells (fill_
 STATE = Path("/dev/shm/pickr_demo_state.json")     # -> live_viewer.py (button)
 CMD = Path("/dev/shm/pickr_demo_cmd")              # <- live_viewer.py ("start" / "stop")
 _arm = {}
+_stop = {"on": False}            # STOP pressed: the main thread is going back to rest
 
 
 def set_state(state, note=""):
@@ -64,13 +67,41 @@ def hold_and_exit(why):
     os._exit(2)
 
 
+def stop_to_rest(why):
+    """STOP: the arm back to the rest pose (lift 8 cm first when low, as Ctrl+C in pickr.sh), then end."""
+    print(f"\n[demo] STOP: {why} - going back to the rest pose", flush=True)
+    p = _arm.get("p")
+    if p is not None:
+        try:
+            from fill_cells import safe_rest
+            safe_rest(p, None)
+        except BaseException as e:                       # noqa: BLE001 - never leave without a message
+            print(f"[demo] back to rest failed: {e}", flush=True)
+    try:
+        import runlog
+        runlog.event("demo_stop", why=why, rest=True)
+        set_state("stopped", f"stopped ({why}) - arm at rest")
+    except Exception:
+        pass
+    os._exit(2)
+
+
 def watch_stop():
+    """STOP -> the main thread gets a KeyboardInterrupt (whatever step it is in) and goes back to rest.
+    HOLD (pressed while it goes back) -> the arm holds where it is, the process ends."""
     while True:
         try:
-            if CMD.read_text().strip() == "stop":
-                hold_and_exit("STOP button")
+            c = CMD.read_text().strip()
         except OSError:
-            pass
+            c = ""
+        if c == "stop" and not _stop["on"]:
+            CMD.unlink(missing_ok=True)
+            _stop["on"] = True
+            set_state("stopping", "STOP: going back to the rest pose - HOLD stops the arm right here")
+            os.kill(os.getpid(), signal.SIGINT)
+        elif c == "hold":
+            CMD.unlink(missing_ok=True)
+            hold_and_exit("HOLD button")
         time.sleep(0.1)
 
 
@@ -126,6 +157,8 @@ class LiveCams:
 
 
 def fail(step, why):
+    if _stop["on"]:                                      # a step ended because of STOP: back to rest, end
+        stop_to_rest("STOP button")
     import live_view
     msg = f"step {step} failed: {why}"
     print(f"[demo] {msg} - demo stopped here", flush=True)
@@ -218,7 +251,8 @@ def main():
               f"{np.round(qb['partition']).tolist() if 'partition' in qb else '-'} px", flush=True)
     live_view.status("partition: VGGT scan")
     try:
-        sc = ps.scan(color, depth, K, part_h=mpargs.part_height)
+        sc = ps.scan(color, depth, K, part_h=mpargs.part_height,
+                     part_size=tuple(mpargs.part_size) if mpargs.part_size else None)   # fixed 33 x 25.5 cm
         g = mp.plan(sc, tcp, sc["box"]["floor_z"], 1.0)
     except (RuntimeError, mp.PlanFail) as e:
         cv2.imwrite(str(out / "partition_plan.png"), color)
@@ -306,4 +340,4 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        hold_and_exit("Ctrl+C")
+        stop_to_rest("STOP button" if _stop["on"] else "Ctrl+C")

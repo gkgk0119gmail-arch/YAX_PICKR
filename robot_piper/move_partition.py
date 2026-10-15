@@ -34,9 +34,13 @@ import hover_test as ht  # noqa: E402
 import live_view  # noqa: E402
 import partition_scene as ps  # noqa: E402
 
-PART_SIZE = None               # partition outline (long, short), m: measured; give it when the far end is cut off
+PART_SIZE = (0.33, 0.255)      # partition outline (long, short), m: fixed (on-site partition 33 x 25.5 cm; measuring
+                               # it read 376 x 268 mm); None = measure it
 CLEAR = 0.04                   # partition bottom above the box rim while it travels (4 cm: team asked higher)
 DROP = 0.008                   # release with the partition bottom this far above the floor / the layer below
+GRASP_SHIFT_M = (0.0, 0.02)    # offset correction: every grasp point moved this far in the robot base frame (x forward,
+                               # y left): 2 cm to the robot's left; the place point follows (same map into the basket)
+RELEASE_LOWER_M = 0.005        # offset correction: let go this much lower than planned (DROP - 5 mm)
 HOVER = 0.05                   # approach line starts this far above the divider tops
 GRIP_DEPTHS = (0.03, 0.025, 0.02, 0.015)   # finger tips below the divider top, deepest that works first: with the
                                # tool tilted 35-45 deg the finger-base corner is only 18-30 mm above the tips
@@ -44,6 +48,20 @@ BETAS = list(range(-45, 46, 5))
 APPROACH_MM = 70.0             # gripper opening going down (35 mm each side of the plate)
 RELEASE_MM = 60.0              # opening to let go inside the box (fingers stay in the two cells)
 HOLD_MM = (1.0, 25.0)          # closed on a cardboard plate (fully closed = nothing in the gripper)
+CLOSE_S = 2.5                  # close on the plate over this long, step by step (one jump closed it too hard)
+
+
+def slow_close(p, effort, from_mm, secs=CLOSE_S):
+    """Close from from_mm to 0 in small steps over secs, then hold closed briefly. Returns the opening (mm)."""
+    n = max(10, int(secs / 0.03))
+    for w in np.linspace(from_mm, 0.0, n):
+        p.GripperCtrl(int(round(w * 1000)), effort, 0x01, 0)
+        time.sleep(secs / n)
+    t0 = time.time()
+    while time.time() - t0 < 0.5:
+        p.GripperCtrl(0, effort, 0x01, 0)
+        time.sleep(0.02)
+    return p.GetArmGripperMsgs().gripper_state.grippers_angle / 1000.0
 EFFORT = 5000                  # gripper effort (0..5000 = 0..5 N m, max): only 2-3 cm of the plate is in the fingers
 WALL_GAP = 0.003               # half thickness of a divider / box wall for the collision check
 MARGIN = 0.004
@@ -182,7 +200,7 @@ def candidates(part):
                 cross.append(u)
         for s in np.arange(0.03, length - 0.03 + 1e-9, STEP):
             if all(abs(s - u) > 0.025 for u in cross):
-                out.append((i, p0 + d["dir"] * s))
+                out.append((i, p0 + d["dir"] * s + np.asarray(GRASP_SHIFT_M)))   # offset correction
     return out
 
 
@@ -196,7 +214,7 @@ def plan(sc, tcp, layer_top_z, side=1.0, verbose=True):
     bodyc, fingc = gripper_parts(tcp, 0.008)
     bottom = part["bottom_z"]
     lift_bottom = box["rim_z"] + CLEAR                   # partition bottom while it travels
-    rel_bottom = max(layer_top_z, box["floor_z"]) + DROP
+    rel_bottom = max(layer_top_z, box["floor_z"]) + DROP - RELEASE_LOWER_M   # offset correction: 5 mm lower
     reach0 = lambda xy: float(np.hypot(*xy))
     cands = candidates(part)
     pre = lambda c: float(np.linalg.norm(c[1] - part["centre"]))   # the middle of the centre divider first
@@ -350,7 +368,7 @@ def run(p, sc, g, args, tcp):
     mv("above the divider", g["L_app"][0])
     gripper(p, APPROACH_MM, args.effort, secs=0.6)
     line("down to the divider", g["L_app"])
-    w = gripper(p, 0.0, args.effort, secs=1.5)
+    w = slow_close(p, args.effort, APPROACH_MM)            # slow squeeze on the plate
     print(f"   gripper closed at {w:.1f} mm", flush=True)
     if not HOLD_MM[0] <= w <= HOLD_MM[1]:
         gripper(p, APPROACH_MM, args.effort, secs=0.6)

@@ -61,11 +61,17 @@ def main():
             return
         if ds["state"] == "ready":
             CMD.write_text("start")
+        elif ds["state"] == "stopping":                 # going back to rest: HOLD = stop right there
+            CMD.write_text("hold")
         elif ds["state"] == "running":
             CMD.write_text("stop")
             pid = int(ds["pid"])
 
-            def kill():                                 # the demo stops itself; if not within 1.5 s: killed
+            def kill(n=0):                              # the demo answers within 1.5 s ("stopping") and goes
+                ds2 = demo_state()                      # back to rest; no answer (or 90 s gone): killed
+                if ds2 is not None and ds2.get("state") == "stopping" and n < 90:
+                    root.after(1000, kill, n + 1)
+                    return
                 try:
                     os.kill(pid, 0)
                     os.kill(pid, signal.SIGKILL)
@@ -88,6 +94,7 @@ def main():
             look = {"preparing": ("PREPARING...", "#555555", "disabled"),
                     "ready": ("START", "#1f9d55", "normal"),
                     "running": ("STOP", "#c0392b", "normal"),
+                    "stopping": ("HOLD", "#8e44ad", "normal"),
                     "done": ("DONE", "#2d6cdf", "disabled")}.get(ds["state"], (ds["state"].upper(), "#555555", "disabled"))
             btn.configure(text=look[0], bg=look[1], activebackground=look[1], state=look[2], disabledforeground="white")
             info.configure(text=ds.get("note", ""))
